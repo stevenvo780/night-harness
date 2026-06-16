@@ -63,7 +63,7 @@ CONSENSUS_N  = int(os.environ.get("LOOP_CONSENSUS", "3")) # muestras de auto-con
 QUORUM       = 2 if CONSENSUS_N >= 2 else 1               # acuerdos mínimos para pasar (1 si el cazador es FIABLE)
 N_SCANNERS   = int(os.environ.get("LOOP_SCANNERS", "4"))  # hilos del LOCAL (rápido/gratis) escaneando a FULL
 N_CHIQUITO   = int(os.environ.get("LOOP_CHIQUITO_HILOS", "2"))  # hilos chiquitos (CLI) que consumen las sospechosas
-SUSPECT_MAX  = int(os.environ.get("LOOP_SUSPECT_MAX", "50"))    # runway del local: cola de ventanas sospechosas
+SUSPECT_MAX  = int(os.environ.get("LOOP_SUSPECT_MAX", "300"))   # tope de memoria de la cola (NO freno: el 9B sigue escaneando si se llena)
 WINDOW       = 150
 DEADLINE     = time.time() + float(os.environ.get("LOOP_HOURS", "8")) * 3600
 QMAX         = 40  # tope de cola para no sobreproducir
@@ -318,20 +318,20 @@ def escalation(level):
 HUNTER_SYS = "Eres un cazador de bugs adversarial, experto en TypeScript/Next.js/Drizzle. Buscas bugs REALES (no estilo). Eres conciso y honesto: si no hay bug claro, lo dices."
 
 def scanner_loop(tid):
-    """TIER 0 — LOCAL: escaneo rápido de AMPLITUD (consenso). Marca ventanas sospechosas → suspectq.
-    Corre a FULL su velocidad y NO espera a los chiquitos (productor-consumidor); solo frena si la cola llena."""
+    """TIER 0 — LOCAL: escaneo CONTINUO de AMPLITUD (consenso) toda la corrida. Marca ventanas sospechosas → suspectq.
+    Corre a FULL su velocidad y NUNCA idlea: si la cola va llena, sigue escaneando (cobertura) sin encolar."""
     mods = list(MODULES)
     while not STOP.is_set() and time.time() < DEADLINE:
         with counter_lock:
             mod = mods[mod_counter[0] % len(mods)]; mod_counter[0] += 1
         m = MEM[mod]
-        if m["hardened"]: time.sleep(1); continue
-        if suspectq.qsize() >= SUSPECT_MAX or bugq.qsize() >= QMAX:
-            time.sleep(1); continue   # backpressure: no sobreproducir
+        # Loop por TIEMPO (LOOP_HOURS), no por iteraciones: el 9B ESCANEA CONTINUO toda la corrida y NUNCA idlea
+        # por backpressure. Sin bugs = éxito (confirma limpio). Re-escanea TODOS los módulos (sin saltar "endurecidos").
         path = random.choice([f for f in MODULES[mod]["files"] if os.path.exists(os.path.join(ROOT, f))] or [None])
         if not path: continue
         code, off = read_window(path)
         if not code: continue
+        ITER_TS[0] = time.time()   # cada escaneo es avance (el watchdog ve progreso aunque la cola esté llena)
         tried = "; ".join(m["tried"][-12:]) or "(ninguna)"
         base = (f"Módulo «{mod}», archivo `{path}`. Nivel: {escalation(m['clean'])}.\n"
                 f"Hipótesis YA probadas (NO repitas): {tried}\n\n"
@@ -357,8 +357,10 @@ def scanner_loop(tid):
         bkey = max(groups, key=lambda k: len(groups[k]))
         if len(groups[bkey]) < QUORUM:
             m["clean"] += 1; _check_hardened(mod); continue
-        suspectq.put({"module": mod, "path": path, "code": code, "hip": groups[bkey][0]})
-        ITER_TS[0] = time.time()
+        # encola al filtro chiquito SOLO si hay espacio; si va saturado, el 9B SIGUE escaneando (el suspect se
+        # re-detecta en otra ronda). Así nunca se frena: cola = runway, no freno.
+        if suspectq.qsize() < SUSPECT_MAX and bugq.qsize() < QMAX:
+            suspectq.put({"module": mod, "path": path, "code": code, "hip": groups[bkey][0]})
 
 def chiquito_loop(tid):
     """TIER 1 — CHIQUITOS: consumen la cola de sospechosas y CAZAN ahí (cheap, diverso). Confirmados → bugq.
@@ -475,8 +477,7 @@ def resolver_loop():
     while not STOP.is_set() and time.time() < DEADLINE:
         try: bug = bugq.get(timeout=5)
         except queue.Empty:
-            if all(MEM[m]["hardened"] for m in MODULES) and E2E_CLEAN.is_set(): break
-            continue
+            continue   # loop por TIEMPO: el resolver espera trabajo hasta el DEADLINE (no para por convergencia)
         path = pick_fix_file(bug)
         if not path: continue
         full = os.path.join(ROOT, path)
@@ -554,23 +555,11 @@ def main():
     threads.append(threading.Thread(target=watchdog_loop, daemon=True))
     threads.append(threading.Thread(target=resolver_loop, daemon=True))
     for t in threads: t.start()
-    # supervisor — CONVERGE-AND-STOP: re-abre pasadas mientras siga ENCONTRANDO fixes; si una pasada
-    # completa no produjo NINGÚN fix nuevo, el código está estable → para (no quema cómputo re-validando
-    # lo mismo 10 veces, que fue el desperdicio de la 1ª noche). Conserva 'tried' entre pasadas.
-    fixes_pasada_previa = -1
+    # supervisor — DURACIÓN POR TIEMPO (LOOP_HOURS), NO por iteraciones/convergencia: corre la corrida COMPLETA
+    # escaneando continuo y confirmando limpio. Cero-bugs = éxito (no para temprano "porque ya validó"). El 9B
+    # nunca idlea; el cómputo local se aprovecha toda la ventana. Solo el DEADLINE (o STOP) lo cierra.
     while time.time() < DEADLINE:
         time.sleep(20); save_status()
-        if all(MEM[m]["hardened"] for m in MODULES) and E2E_CLEAN.is_set():
-            total = sum(len(MEM[m]["fixed"]) for m in list(MODULES) + ["ui"])
-            if total == fixes_pasada_previa:
-                log("✓ Pasada completa SIN fixes nuevos (código + crawl E2E) → ESTABLE, convergió. Parando."); break
-            fixes_pasada_previa = total
-            with mem_lock:
-                for mm in MODULES:
-                    MEM[mm]["hardened"] = False; MEM[mm]["clean"] = 0
-            E2E_CLEAN.clear()
-            log(f"✓ Pasada completa ({total} fixes) — abriendo otra; para al converger.")
-            save_mem()
     STOP.set(); log("Cerrando. Construyendo build final...")
     time.sleep(3)
     try:

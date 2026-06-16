@@ -90,8 +90,9 @@ una fase "solo-fix" con el grande sin interleave con el chico. No los alternes r
 git worktree add -B night-harness /tmp/wt HEAD
 DATABASE_URL="postgres://localhost:5432/app_e2e" PORT=3011 npm run dev -- --port 3011 &
 
-# 2) Lanza el harness (todo configurable por env; ver abajo).
-LOOP_HOURS=8 LOOP_HUNTERS=3 python3 harness.py
+# 2) Lanza el harness. Monorepo (subdir) + id sembrado para crawl de rutas [id]:
+LOOP_WT=/tmp/wt LOOP_SUBDIR=apps/dashboard LOOP_DYNAMIC_ID=<un-id-real-de-tu-db-de-test> \
+  LOOP_HOURS=8 LOOP_HUNTERS=3 python3 harness.py
 
 # 3) En la mañana: revisa la rama + /tmp/loop-needs-review.json y MERGEA a mano lo que valga.
 ```
@@ -106,9 +107,18 @@ LOOP_HOURS=8 LOOP_HUNTERS=3 python3 harness.py
 | `LOOP_HUNTERS` | `4` | hilos cazadores |
 | `LOOP_TARGET` | `50` | rondas limpias para "endurecer" un módulo |
 | `LOOP_HOURS` | `8` | deadline duro |
-| `LOOP_DEV_URL` | `http://localhost:3011` | dev server para el sweep E2E |
+| `LOOP_DEV_URL` | `http://localhost:3011` | dev server para el crawl E2E |
+| `LOOP_WT` | `/tmp/wt` | git worktree aislado (rama desechable) |
+| `LOOP_SUBDIR` | `` (raíz) | subdir del proyecto en el worktree, p.ej. `apps/dashboard` |
+| `LOOP_STORAGE_STATE` | `` | `storageState.json` de Playwright (sesión autenticada); vacío = modo demo |
+| `LOOP_DYNAMIC_ID` | `` | id sembrado para crawl de rutas `[id]` (vacío = se omiten) |
+| `LOOP_BIG_RESOLVER` | `0` | `1` si el resolver es grande → espera disponibilidad con backoff antes de cada fix |
+| `LOOP_E2E_ACTIONS` | `24` | interacciones máximas por ruta (forms/botones/modales) |
+| `LOOP_E2E_BUDGET_MS` | `70000` | presupuesto de crawl profundo por ruta |
+| `LOOP_STALL_SECS` | `360` | watchdog: sin avance N s → recuperación (libera modelos pesados de Ollama) |
 
-`MODULES` (mapa módulo → archivos + rutas) se edita arriba en `harness.py`.
+`MODULES` (para el cazador de CÓDIGO) se edita en `harness.py`. Las **rutas E2E se descubren solas**
+del directorio `app/` (App Router) — no hay que listarlas.
 
 ## Seguridad
 
@@ -119,13 +129,22 @@ LOOP_HOURS=8 LOOP_HUNTERS=3 python3 harness.py
 
 ## Archivos
 
-- `harness.py` — orquestador (hunters + sweep + resolver + opus + memoria + converge-stop).
-- `e2e-runner.js` — sonda Playwright (navega una ruta, capta errores de consola/#419/5xx).
-- Estado en runtime: `/tmp/loop-nocturno.log`, `/tmp/loop-nocturno-status.json`,
-  `/tmp/loop-memory.json`, `/tmp/loop-needs-review.json`.
+- `harness.py` — orquestador (hunters de código + crawl E2E + resolver + watchdog + opus + memoria + converge-stop).
+- `e2e-runner.js` — crawler PROFUNDO Playwright: navega + llena forms + submit + clickea botones + abre
+  modales + cambia selects; capta consola/#419/HTTP≥400/requests fallidas/UI de error.
+- Estado en runtime: `/tmp/loop-nocturno.log`, `/tmp/loop-nocturno-status.json`, `/tmp/loop-memory.json`,
+  `/tmp/loop-needs-review.json`, `/tmp/loop-e2e-findings.json` (TODOS los hallazgos E2E, para revisión).
 
-## Estado
+## Estado (v2 — intensivo + resiliente)
 
-Funcional. Validó un código real (descartó decenas de falsos positivos sin dañar nada). Las mejoras
-del post-mortem (1 modelo, sin reintento, converge-stop) están aplicadas. Próximos pasos posibles:
-watchdog de stall, fase "solo-fix" con modelo grande, seeding de datos para E2E de mutación.
+- **Cobertura real:** descubre TODAS las rutas del App Router (en Deméter: 55) y **ejercita cada una a
+  fondo** (forms, submit, botones, modales) — ya no solo navega. Cada hallazgo se registra para revisión
+  humana aunque no se auto-arregle.
+- **Resiliencia:** `wait_for_model` con backoff (si usas un modelo grande, **espera a que arranque/se
+  libere** antes de cada fix); **watchdog** que detecta stalls y **libera modelos pesados que acaparen
+  Ollama** (recuperación automática del wedge nocturno); sin reintentos que encolen.
+- **Lecciones de la 1ª noche aplicadas:** 1 modelo por defecto (sin contención), sin reintento,
+  converge-and-stop.
+
+Próximo: seeding automático de datos + `storageState` para flujos de MUTACIÓN aún más profundos
+(tomar→aceptar→despachar→facturar end-to-end con datos reales en la DB de test).

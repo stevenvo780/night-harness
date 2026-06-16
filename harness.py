@@ -27,8 +27,10 @@ HUNTER    = os.environ.get("LOOP_HUNTER", "qwen3.5:9b")
 # residentes (RAM suficiente + OLLAMA_MAX_LOADED_MODELS>=2 + OLLAMA_KEEP_ALIVE largo) o córrelo en
 # una FASE separada (sin interleave con el chico). Ver README §"Contención de modelos".
 RESOLVER  = os.environ.get("LOOP_RESOLVER", "qwen3.5:9b")
-WT        = "/tmp/demeter-loop"
-ROOT      = WT + "/apps/dashboard"
+WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
+SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
+ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
+def gp(p): return os.path.join(SUBDIR, p) if SUBDIR else p  # path relativo al worktree, para git
 DEV_URL   = os.environ.get("LOOP_DEV_URL", "http://localhost:3011")
 RUNNER    = "/tmp/demeter-e2e-runner.js"
 LOG       = "/tmp/loop-nocturno.log"
@@ -41,6 +43,17 @@ N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "4"))
 WINDOW       = 150
 DEADLINE     = time.time() + float(os.environ.get("LOOP_HOURS", "8")) * 3600
 QMAX         = 40  # tope de cola para no sobreproducir
+# --- E2E PROFUNDO + RESILIENCIA (v2) ---
+STORAGE_STATE   = os.environ.get("LOOP_STORAGE_STATE", "")        # storageState.json (sesión auth); vacío = modo demo
+E2E_BUDGET_MS   = int(os.environ.get("LOOP_E2E_BUDGET_MS", "70000"))  # presupuesto de crawl profundo por ruta
+E2E_MAX_ACTIONS = int(os.environ.get("LOOP_E2E_ACTIONS", "24"))   # interacciones máximas por ruta
+APP_DIR         = os.environ.get("LOOP_APP_DIR", "app")           # dir de rutas Next (relativo a ROOT)
+DYNAMIC_ID      = os.environ.get("LOOP_DYNAMIC_ID", "")           # id sembrado para rutas [id] (vacío = se omiten)
+BIG_RESOLVER    = os.environ.get("LOOP_BIG_RESOLVER", "0") == "1" # resolver grande: esperar disponibilidad + no interleavear
+STALL_SECS      = int(os.environ.get("LOOP_STALL_SECS", "360"))   # watchdog: sin avance => recuperación
+FINDINGS        = "/tmp/loop-e2e-findings.json"                   # TODOS los hallazgos E2E (para revisión humana)
+E2E_CLEAN       = threading.Event()                              # set cuando una pasada de crawl no halló nada nuevo
+ITER_TS         = [time.time()]                                  # marca de último avance (watchdog)
 
 MODULES = {
   "pedidos":         {"files": ["lib/queries/pedidos.ts","lib/queries/pedidos-shared.ts","app/(panel)/pedidos/[id]/page.tsx"], "routes": ["/pedidos/recibidos","/pedidos","/pedidos/nuevo"]},
@@ -77,7 +90,7 @@ def load_mem():
     if os.path.exists(MEMFILE):
         try: MEM = json.load(open(MEMFILE));
         except Exception: MEM = {}
-    for m in MODULES:
+    for m in list(MODULES) + ["ui"]:   # "ui" = módulo catch-all para hallazgos E2E de rutas descubiertas
         MEM.setdefault(m, {"clean": 0, "iter": 0, "tried": [], "confirmed": [], "fixed": [], "queued_keys": [], "hardened": False, "rejected": 0})
 def save_mem():
     with mem_lock:
@@ -123,13 +136,56 @@ def typecheck():
 
 def git(*a): return subprocess.run(["git", "-C", WT, *a], capture_output=True, text=True)
 
-def probe(route, steps=None):
-    scn = {"baseURL": DEV_URL, "steps": ([{"action": "goto", "url": route}] + (steps or []))}
+def probe(route):
+    """Crawl PROFUNDO de una ruta con e2e-runner v2: navega + llena forms + submit + clickea + modales."""
+    scn = {"baseURL": DEV_URL, "route": route, "storageState": STORAGE_STATE,
+           "maxActions": E2E_MAX_ACTIONS, "budgetMs": E2E_BUDGET_MS}
+    env = dict(os.environ, DASHBOARD_NM=os.path.join(ROOT, "node_modules"))
     try:
-        p = subprocess.run(["node", RUNNER], input=json.dumps(scn), cwd=ROOT, capture_output=True, text=True, timeout=90)
-        return json.loads(p.stdout or "{}")
+        p = subprocess.run(["node", RUNNER], input=json.dumps(scn), cwd=ROOT,
+                           capture_output=True, text=True, timeout=E2E_BUDGET_MS / 1000 + 40, env=env)
+        r = json.loads(p.stdout or "{}"); r.setdefault("errors", []); r.setdefault("ok", True)
+        return r
     except Exception as e:
-        return {"ok": True, "fatal": str(e)}
+        return {"ok": True, "errors": [], "fatal": str(e)}
+
+# ----- descubrimiento de rutas + resiliencia (v2) -----
+ROUTE_FILE = {}  # ruta -> page.tsx relativo (para que el resolver sepa qué archivo mirar)
+def discover_routes():
+    base = os.path.join(ROOT, APP_DIR)
+    for dp, _, files in os.walk(base):
+        page = next((f for f in files if f in ("page.tsx", "page.ts", "page.jsx")), None)
+        if not page: continue
+        rel = os.path.relpath(dp, base)
+        segs, skip = [], False
+        if rel != ".":
+            for s in rel.split(os.sep):
+                if s.startswith("(") and s.endswith(")"): continue          # route group
+                if s.startswith("@"): skip = True; break                    # parallel slot
+                if s.startswith("[") and s.endswith("]"):
+                    if DYNAMIC_ID: segs.append(DYNAMIC_ID)
+                    else: skip = True; break                                # ruta dinámica sin id sembrado
+                else: segs.append(s)
+        if skip: continue
+        route = "/" + "/".join(segs)
+        if route.startswith("/api"): continue
+        ROUTE_FILE[route] = os.path.relpath(os.path.join(dp, page), ROOT)
+    return sorted(ROUTE_FILE)
+
+def model_health(model, timeout=20):
+    """Latencia de un ping mínimo; None si no responde a tiempo."""
+    t = time.time()
+    r = call_model(model, "ok", npred=2, think=False, timeout=timeout)
+    return None if r == "" else time.time() - t
+
+def wait_for_model(model, max_wait=1800):
+    """Bloquea con backoff hasta que el modelo responda (caso: usar el 80B y que arranque/se libere)."""
+    delay, waited = 10, 0
+    while not STOP.is_set() and waited < max_wait:
+        if model_health(model, timeout=25) is not None: return True
+        log(f"  [espera] {model} no responde — reintentando en {delay}s (resiliencia)")
+        time.sleep(delay); waited += delay; delay = min(delay * 2, 120)
+    return False
 
 def apply_old_new(path, old, new):
     full = os.path.join(ROOT, path)
@@ -227,26 +283,64 @@ def _check_hardened(mod):
         m["hardened"] = True; log(f"✓ MÓDULO ENDURECIDO: {mod} ({TARGET_CLEAN} rondas limpias)")
 
 # ----- SWEEP (productor, navegador) -----
-def sweep_loop():
+E2E_SEEN = set()      # firmas de hallazgos ya vistos (dedup global)
+e2e_lock = threading.Lock()
+def _route_module(route):
+    seg = route.strip("/").split("/")[0] if route != "/" else "inicio"
+    for m in MODULES:
+        if seg and (seg in m or m.split("-")[0] == seg): return m
+    return "ui"
+
+def e2e_loop():
+    """Crawl PROFUNDO e intensivo de TODAS las rutas descubiertas. Registra cada hallazgo (para revisión
+    humana) y encola los arreglables. Es el motor de 'testear cada rincón'."""
+    routes = discover_routes()
+    log(f"[E2E] descubiertas {len(routes)} rutas para crawl profundo: {', '.join(routes[:12])}{'…' if len(routes)>12 else ''}")
     while not STOP.is_set() and time.time() < DEADLINE:
-        for mod, cfg in MODULES.items():
+        nuevos = 0
+        for route in routes:
             if STOP.is_set() or time.time() >= DEADLINE: break
-            if MEM[mod]["hardened"] or bugq.qsize() >= QMAX: continue
-            for route in cfg["routes"]:
-                with repo_lock:
-                    res = probe(route)
-                errs = (res.get("pageErrors") or []) + (res.get("http5xx") or []) + (res.get("consoleErrors") or [])
-                if errs and res.get("ok") is False:
-                    key = f"runtime:{route}"
-                    with mem_lock:
-                        if key in MEM[mod]["queued_keys"]: continue
-                        MEM[mod]["queued_keys"].append(key)
-                    MEM[mod]["clean"] = 0
-                    bugq.put({"module": mod, "type": "runtime", "route": route, "errors": errs[:4],
-                              "risk": "alto", "path": None})
-                    log(f"[SWEEP] {mod} {route}: navegador halló {len(errs)} error(es) → {errs[0][:80]}")
-                time.sleep(0.5)
+            while bugq.qsize() >= QMAX and not STOP.is_set() and time.time() < DEADLINE: time.sleep(2)
+            res = probe(route)  # crawl lock-free: solo el RESOLVER toma repo_lock (al editar); su re-verify filtra falsos transitorios
+            ITER_TS[0] = time.time()  # avance (para el watchdog)
+            for err in res.get("errors", []):
+                sig = f"{route}|{err.get('kind')}|{str(err.get('detail',''))[:60]}"
+                with e2e_lock:
+                    if sig in E2E_SEEN: continue
+                    E2E_SEEN.add(sig)
+                nuevos += 1
+                find = {"route": route, "file": ROUTE_FILE.get(route, ""), "ts": now(), **err}
+                allf = json.load(open(FINDINGS)) if os.path.exists(FINDINGS) else []
+                allf.append(find); json.dump(allf, open(FINDINGS, "w"), ensure_ascii=False, indent=1)
+                log(f"[E2E] {route} :: {err.get('kind')} → {str(err.get('detail',''))[:90]}")
+                bugq.put({"module": _route_module(route), "type": "runtime", "route": route,
+                          "errors": [f"{err.get('kind')}: {err.get('detail','')}"],
+                          "risk": "alto", "path": ROUTE_FILE.get(route, None)})
+            time.sleep(0.3)
+        if nuevos == 0: E2E_CLEAN.set()
+        else: E2E_CLEAN.clear()
+        log(f"[E2E] pasada de crawl completa: {nuevos} hallazgos nuevos (total únicos: {len(E2E_SEEN)}).")
         time.sleep(5)
+
+def watchdog_loop():
+    """Recuperación automática: si no hay avance en STALL_SECS, libera modelos pesados que estén
+    acaparando memoria en Ollama (la causa del wedge nocturno) y re-evalúa salud del resolver."""
+    while not STOP.is_set() and time.time() < DEADLINE:
+        time.sleep(60)
+        if time.time() - ITER_TS[0] < STALL_SECS: continue
+        log(f"[WATCHDOG] sin avance hace >{STALL_SECS}s — recuperación: liberando modelos pesados de Ollama")
+        try:
+            ps = json.loads(urllib.request.urlopen(BASE + "/api/ps", timeout=10).read()).get("models", [])
+            for m in ps:
+                nm = m.get("name", "")
+                if nm not in (HUNTER, RESOLVER) and m.get("size", 0) > 20e9:  # >20GB y no lo usamos
+                    urllib.request.urlopen(urllib.request.Request(
+                        BASE + "/api/generate", data=json.dumps({"model": nm, "keep_alive": 0, "prompt": ""}).encode(),
+                        headers={"Content-Type": "application/json"}), timeout=20).read()
+                    log(f"[WATCHDOG] unload enviado a {nm} ({round(m.get('size',0)/1e9)}GB)")
+        except Exception as e:
+            log(f"[WATCHDOG] no pude consultar/liberar Ollama: {e}")
+        ITER_TS[0] = time.time()  # evita spamear; re-evalúa en el próximo ciclo
 
 # ----- RESOLVER (consumidor, cerebro) -----
 RESOLVER_SYS = "Eres ingeniero senior TypeScript/Next.js/Drizzle. Arreglas bugs con cambios MÍNIMOS y correctos, sin romper nada ni debilitar seguridad. Devuelves SOLO el bloque pedido."
@@ -260,7 +354,7 @@ def resolver_loop():
     while not STOP.is_set() and time.time() < DEADLINE:
         try: bug = bugq.get(timeout=5)
         except queue.Empty:
-            if all(MEM[m]["hardened"] for m in MODULES): break
+            if all(MEM[m]["hardened"] for m in MODULES) and E2E_CLEAN.is_set(): break
             continue
         path = pick_fix_file(bug)
         if not path: continue
@@ -280,6 +374,8 @@ def resolver_loop():
         prompt = (f"{desc}\n\nArchivo `{path}`. {triage}\n"
                   f"Si SÍ hay que arreglarlo, devuelve SOLO la edición quirúrgica (OLD = copia EXACTA y única del código actual):\n"
                   f"<<<OLD>>>\n<código exacto>\n<<<NEW>>>\n<código corregido>\n<<<END>>>\n\nCÓDIGO:\n{ctx}")
+        if BIG_RESOLVER and not wait_for_model(RESOLVER):
+            continue  # resolver grande no disponible tras esperar con backoff → pasa al siguiente bug
         out = call_model(RESOLVER, prompt, system=RESOLVER_SYS, npred=450, timeout=280, think=False)
         if "NOT_A_BUG" in out and "<<<OLD>>>" not in out:
             MEM[bug["module"]]["rejected"] += 1
@@ -300,16 +396,16 @@ def resolver_loop():
                 MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: descartado ({why})"); continue
             tc_ok, tc_out = typecheck()
             if not tc_ok:
-                git("checkout", "--", "apps/dashboard/" + path)
+                git("checkout", "--", gp(path))
                 MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: revertido (rompe tsc)"); continue
             # re-prueba E2E si fue bug de runtime
             if bug["type"] == "runtime":
                 res = probe(bug["route"])
-                if res.get("ok") is False and (res.get("pageErrors") or res.get("http5xx")):
-                    git("checkout", "--", "apps/dashboard/" + path)
+                if res.get("ok") is False and res.get("errors"):
+                    git("checkout", "--", gp(path))
                     MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: revertido (E2E sigue roja)"); continue
             git("add", "-A")
-            diff = git("diff", "--cached", "--", "apps/dashboard/" + path).stdout
+            diff = git("diff", "--cached", "--", gp(path)).stdout
             msg = f"fix({bug['module']}): {bug.get('hip') or bug.get('route')} [local]"
             git("commit", "-q", "-m", msg)
         # revisión Opus para riesgosos (fuera del lock; ya commiteado en rama)
@@ -329,7 +425,8 @@ def main():
     open(LOG, "a").write("\n" + "=" * 70 + f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} HARNESS NOCTURNO E2E · hunter={HUNTER} resolver={RESOLVER}\n" + "=" * 70 + "\n")
     load_mem(); save_status()
     threads = [threading.Thread(target=hunter_loop, args=(i,), daemon=True) for i in range(N_HUNTERS)]
-    threads.append(threading.Thread(target=sweep_loop, daemon=True))
+    threads.append(threading.Thread(target=e2e_loop, daemon=True))
+    threads.append(threading.Thread(target=watchdog_loop, daemon=True))
     threads.append(threading.Thread(target=resolver_loop, daemon=True))
     for t in threads: t.start()
     # supervisor — CONVERGE-AND-STOP: re-abre pasadas mientras siga ENCONTRANDO fixes; si una pasada
@@ -338,15 +435,16 @@ def main():
     fixes_pasada_previa = -1
     while time.time() < DEADLINE:
         time.sleep(20); save_status()
-        if all(MEM[m]["hardened"] for m in MODULES):
-            total = sum(len(MEM[m]["fixed"]) for m in MODULES)
+        if all(MEM[m]["hardened"] for m in MODULES) and E2E_CLEAN.is_set():
+            total = sum(len(MEM[m]["fixed"]) for m in list(MODULES) + ["ui"])
             if total == fixes_pasada_previa:
-                log("✓ Pasada completa SIN fixes nuevos → código ESTABLE, convergió. Parando."); break
+                log("✓ Pasada completa SIN fixes nuevos (código + crawl E2E) → ESTABLE, convergió. Parando."); break
             fixes_pasada_previa = total
             with mem_lock:
                 for mm in MODULES:
                     MEM[mm]["hardened"] = False; MEM[mm]["clean"] = 0
-            log(f"✓ Pasada completa ({total} fixes acumulados) — abriendo otra; para al converger.")
+            E2E_CLEAN.clear()
+            log(f"✓ Pasada completa ({total} fixes) — abriendo otra; para al converger.")
             save_mem()
     STOP.set(); log("Cerrando. Construyendo build final...")
     time.sleep(3)

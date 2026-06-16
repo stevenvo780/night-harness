@@ -364,8 +364,11 @@ def chiquito_loop(tid):
             with counter_lock:
                 chiq = CHIQUITOS[mod_counter[0] % len(CHIQUITOS)]
             ch = call_provider(chiq,
-                f"El escaneo LOCAL marcó esta ventana como sospechosa (pista: «{hip}»). CAZA el bug REAL aquí; si está "
-                f"limpio, dilo. Responde SOLO JSON {{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras>\"}}.\n\n{code}",
+                f"Un escáner local RUIDOSO (suele ALUCINAR) sospecha de esta ventana (pista: «{hip}»). Sé ESCÉPTICO y "
+                f"RIGUROSO: la MAYORÍA de estas pistas son FALSAS — el código suele YA manejar el caso (null/empty/await), "
+                f"Drizzle PARAMETRIZA sql${'{...}'} (no es inyección), etc. ¿Hay de verdad un bug REAL, concreto y accionable "
+                f"AQUÍ? Ante la duda o si el código ya lo maneja → hay_bug:false. Solo di true si estás SEGURO. "
+                f"Responde SOLO JSON {{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras, solo si REAL>\"}}.\n\n{code}",
                 system=HUNTER_SYS, timeout=120)
             try:
                 cj = json.loads(ch[ch.index("{"):ch.rindex("}") + 1])

@@ -34,11 +34,12 @@ RESOLVER  = os.environ.get("LOOP_RESOLVER", "qwen3.5:9b")
 #   · JUEZ/triage  → alta frecuencia (1 por candidato) → modelo capaz pero BARATO (gemini -p).
 #   · FIXER        → baja frecuencia (solo bugs confirmados) → puede ser agéntico/caro (codex).
 #   · REVISOR      → rarísimo (solo fixes riesgosos) → cruce de familia.
-JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "claude:haiku,gemini:gemini-2.5-flash,gemini:gemini-3-pro-preview").split(",") if j.strip()]
+JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "claude:haiku,gemini:gemini-2.5-flash,gemini:gemini-3-pro-preview,qwen3-coder:30b-32k").split(",") if j.strip()]  # último = local (fallback si toda la nube se agota)
 JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "2"))                       # ESCALERA: 2 baratos (haiku+flash) bastan; gemini-3-pro SOLO desempata; Codex/Opus aguas abajo
-FIXER     = os.environ.get("LOOP_FIXER", "codex")                           # FIXER (familia distinta al juez)
-REVIEWER  = os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview")  # revisa fixes RIESGOSOS (cruce de familia)
-ARBITER   = os.environ.get("LOOP_ARBITER", "claude:opus")                  # 🏆 EL MEJOR (Opus): ÁRBITRO FINAL, SOLO cuando el revisor DUDA (escalada) — rarísimo, máximo juicio por el costo
+# Cada rol es una CADENA de fallback (orden = preferencia): si el 1º se agota por cuota, usa el siguiente.
+FIXER_CHAIN    = [x.strip() for x in os.environ.get("LOOP_FIXER", "codex,gemini:gemini-3-pro-preview,qwen3-coder:30b-32k").split(",") if x.strip()]  # Codex (dura MENOS) → Gemini Pro → local
+REVIEWER_CHAIN = [x.strip() for x in os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview,claude:haiku").split(",") if x.strip()]            # revisa riesgosos; fallback
+ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus,gemini:gemini-3-pro-preview").split(",") if x.strip()]              # 🏆 Opus; fallback Gemini Pro si Claude agotado
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -138,23 +139,49 @@ def _strip(s):
     s = re.sub(r"(?is)\ntokens used\s*\n[\d,]+\s*", "\n", s)
     return s.strip()
 
+# --- FALLBACK por cuota agotada / rate-limit (sobre todo Codex, que dura menos) ---
+DEAD = {}                       # proveedor -> epoch hasta el que se considera agotado (cuarentena)
+DEAD_LOCK = threading.Lock()
+QUOTA_COOLDOWN = int(os.environ.get("LOOP_QUOTA_COOLDOWN", "1800"))  # 30 min en cuarentena tras agotarse
+QUOTA_RE = re.compile(r"rate.?limit|quota|429|exhaust|usage limit|too many request|insufficient|overloaded|resource_exhausted|limit reached", re.I)
+def _is_dead(p):
+    with DEAD_LOCK: return DEAD.get(p, 0) > time.time()
+def _mark_dead(p, why):
+    with DEAD_LOCK: DEAD[p] = time.time() + QUOTA_COOLDOWN
+    log(f"  [CUOTA] {p} agotado/limitado → cuarentena {QUOTA_COOLDOWN // 60}min, uso fallback ({str(why)[:55]})")
+def _run_cli(cmd, timeout):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return _strip(p.stdout), (p.stdout or "") + "\n" + (p.stderr or "")
+
 def call_provider(provider, prompt, timeout=150, system=None):
-    """Enruta a un proveedor DIVERSO: gemini:<model> | codex | claude:<model> | ollama:<model> | <modelo-ollama>."""
+    """Enruta: gemini:<model> | codex[:model] | claude:<model> | ollama:<model> | <modelo-ollama>.
+    Si el proveedor está EN CUARENTENA por cuota, devuelve '' (que el caller use fallback)."""
+    if _is_dead(provider): return ""
     full = (system + "\n\n" + prompt) if system else prompt
     try:
         if provider.startswith("gemini:"):
-            p = subprocess.run(["gemini", "-m", provider.split(":", 1)[1], "-p", full], capture_output=True, text=True, timeout=timeout)
-            return _strip(p.stdout)
-        if provider.split(":")[0] == "codex":
-            p = subprocess.run(["codex", "exec", full], capture_output=True, text=True, timeout=timeout)
-            return _strip(p.stdout)
-        if provider.startswith("claude:"):
-            p = subprocess.run(["claude", "-p", full, "--model", provider.split(":", 1)[1]], capture_output=True, text=True, timeout=timeout)
-            return _strip(p.stdout)
-        model = provider.split(":", 1)[1] if provider.startswith("ollama:") else provider
-        return call_model(model, prompt, system=system, timeout=timeout, think=False)
+            text, raw = _run_cli(["gemini", "-m", provider.split(":", 1)[1], "-p", full], timeout)
+        elif provider.split(":")[0] == "codex":
+            cmd = ["codex", "exec"] + (["-m", provider.split(":", 1)[1]] if ":" in provider else []) + [full]
+            text, raw = _run_cli(cmd, timeout)
+        elif provider.startswith("claude:"):
+            text, raw = _run_cli(["claude", "-p", full, "--model", provider.split(":", 1)[1]], timeout)
+        else:  # ollama LOCAL: sin cuota, no se agota
+            model = provider.split(":", 1)[1] if provider.startswith("ollama:") else provider
+            return call_model(model, prompt, system=system, timeout=timeout, think=False)
+        if not text and QUOTA_RE.search(raw): _mark_dead(provider, raw)
+        return text
     except Exception as e:
+        if QUOTA_RE.search(str(e)): _mark_dead(provider, str(e))
         log(f"  [provider err {provider}] {e}"); return ""
+
+def call_chain(chain, prompt, timeout=200, system=None):
+    """Prueba los proveedores EN ORDEN (cadena de fallback); usa el primero que responda; salta los en cuarentena.
+    Devuelve (texto, proveedor_usado) o ('', None) si TODA la cadena falló."""
+    for p in chain:
+        out = call_provider(p, prompt, timeout=timeout, system=system)
+        if out: return out, p
+    return "", None
 
 def judge_panel(desc, code, path, providers=None, min_votes=None, early_stop=True):
     """Panel DIVERSO: cada votante (familia distinta) vota REAL vs NOT_A_BUG. Confirmado si >= min_votes votan REAL.
@@ -433,9 +460,9 @@ def resolver_loop():
         fixprompt = (f"{desc}\n\nArchivo `{path}`. Es un bug REAL confirmado. Devuelve SOLO la edición quirúrgica "
                      f"(OLD = copia EXACTA y ÚNICA del código actual; cambio mínimo, no rompas nada):\n"
                      f"<<<OLD>>>\n<código exacto>\n<<<NEW>>>\n<código corregido>\n<<<END>>>\n\nCÓDIGO:\n{ctx}")
-        out = call_provider(FIXER, fixprompt, timeout=240)
+        out, fixer_used = call_chain(FIXER_CHAIN, fixprompt, timeout=240)
         if "<<<OLD>>>" not in out or "<<<NEW>>>" not in out:
-            MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: el fixer ({FIXER.split(':')[0]}) no produjo edición"); continue
+            MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: ningún fixer de la cadena produjo edición"); continue
         try:
             old = out.split("<<<OLD>>>", 1)[1].split("<<<NEW>>>", 1)[0].strip("\n")
             new = out.split("<<<NEW>>>", 1)[1].split("<<<END>>>", 1)[0].strip("\n")
@@ -466,17 +493,17 @@ def resolver_loop():
         if bug["risk"] == "alto" and REVIEWER:
             rq = (f"Revisa este diff de un fix a un bug de RIESGO (dinero/stock/estado/auth). ¿Es CORRECTO y SEGURO "
                   f"sin romper nada? Responde una línea: OK | DUDOSO | MAL + motivo.\n\nBUG: {desc}\n\nDIFF:\n{diff[:6000]}")
-            verdict = call_provider(REVIEWER, rq, timeout=150)[:300]
+            verdict = call_chain(REVIEWER_CHAIN, rq, timeout=150)[0][:300]
             # ESCALADA AL ÁRBITRO (Opus) SOLO si el revisor DUDA o lo marca mal → caso difícil que merece al mejor
             arbiter = ""
-            if ARBITER and re.search(r"DUDOSO|MAL|incorrect|unsafe|riesg", verdict, re.I):
-                arbiter = call_provider(ARBITER, rq + f"\n\nUn revisor previo dictaminó: «{verdict}». Da el VEREDICTO FINAL (OK|MAL + por qué).", timeout=200)[:300]
+            if ARBITER_CHAIN and re.search(r"DUDOSO|MAL|incorrect|unsafe|riesg", verdict, re.I):
+                arbiter = call_chain(ARBITER_CHAIN, rq + f"\n\nUn revisor previo dictaminó: «{verdict}». Da el VEREDICTO FINAL (OK|MAL + por qué).", timeout=200)[0][:300]
                 log(f"[R] {bug['module']}: ⚖️ ESCALADO a Opus (árbitro): {arbiter[:70]}")
             entry = {"module": bug["module"], "desc": desc[:200], "commit": git("rev-parse", "--short", "HEAD").stdout.strip(),
                      "review": verdict, "arbiter_opus": arbiter, "ts": now()}
             rev = json.load(open(REVIEW)) if os.path.exists(REVIEW) else []
             rev.append(entry); json.dump(rev, open(REVIEW, "w"), ensure_ascii=False, indent=1)
-            log(f"[R] {bug['module']}: FIX riesgoso + revisión {REVIEWER.split(':')[0]}: {verdict[:70]}")
+            log(f"[R] {bug['module']}: FIX riesgoso + revisión: {verdict[:70]}")
         else:
             log(f"[R] {bug['module']}: FIX commiteado «{(bug.get('hip') or bug.get('route'))[:50]}»")
         MEM[bug["module"]]["fixed"].append(bug.get("hip") or bug.get("route"))

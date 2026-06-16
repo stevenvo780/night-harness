@@ -56,8 +56,11 @@ REVIEW    = "/tmp/loop-needs-review.json"
 
 TARGET_CLEAN = int(os.environ.get("LOOP_TARGET", "50"))
 N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "6"))  # el cazador caza a full; los jueces fuertes filtran
-CONSENSUS_N  = int(os.environ.get("LOOP_CONSENSUS", "3")) # muestras de auto-consistencia del CAZADOR
+CONSENSUS_N  = int(os.environ.get("LOOP_CONSENSUS", "3")) # muestras de auto-consistencia del escaneo LOCAL
 QUORUM       = 2 if CONSENSUS_N >= 2 else 1               # acuerdos mínimos para pasar (1 si el cazador es FIABLE)
+N_SCANNERS   = int(os.environ.get("LOOP_SCANNERS", "4"))  # hilos del LOCAL (rápido/gratis) escaneando a FULL
+N_CHIQUITO   = int(os.environ.get("LOOP_CHIQUITO_HILOS", "2"))  # hilos chiquitos (CLI) que consumen las sospechosas
+SUSPECT_MAX  = int(os.environ.get("LOOP_SUSPECT_MAX", "50"))    # runway del local: cola de ventanas sospechosas
 WINDOW       = 150
 DEADLINE     = time.time() + float(os.environ.get("LOOP_HOURS", "8")) * 3600
 QMAX         = 40  # tope de cola para no sobreproducir
@@ -90,6 +93,7 @@ RISK_RE = re.compile(r"(dinero|saldo|cupo|amount|owed|ledger|precio|price|cobro|
 
 # ----- infra concurrente -----
 bugq       = queue.Queue()
+suspectq   = queue.Queue()   # TIER0→TIER1: ventanas que el LOCAL marcó, para que los chiquitos cacen (desacople)
 repo_lock  = threading.Lock()   # exclusión mutua: resolver-fix-cycle  vs  sweep (dev server + archivos)
 mem_lock   = threading.Lock()
 mod_counter = [0]
@@ -305,14 +309,17 @@ def escalation(level):
 
 HUNTER_SYS = "Eres un cazador de bugs adversarial, experto en TypeScript/Next.js/Drizzle. Buscas bugs REALES (no estilo). Eres conciso y honesto: si no hay bug claro, lo dices."
 
-def hunter_loop(tid):
+def scanner_loop(tid):
+    """TIER 0 — LOCAL: escaneo rápido de AMPLITUD (consenso). Marca ventanas sospechosas → suspectq.
+    Corre a FULL su velocidad y NO espera a los chiquitos (productor-consumidor); solo frena si la cola llena."""
     mods = list(MODULES)
     while not STOP.is_set() and time.time() < DEADLINE:
         with counter_lock:
             mod = mods[mod_counter[0] % len(mods)]; mod_counter[0] += 1
         m = MEM[mod]
         if m["hardened"]: time.sleep(1); continue
-        if bugq.qsize() >= QMAX: time.sleep(2); continue
+        if suspectq.qsize() >= SUSPECT_MAX or bugq.qsize() >= QMAX:
+            time.sleep(1); continue   # backpressure: no sobreproducir
         path = random.choice([f for f in MODULES[mod]["files"] if os.path.exists(os.path.join(ROOT, f))] or [None])
         if not path: continue
         code, off = read_window(path)
@@ -323,7 +330,6 @@ def hunter_loop(tid):
                 f"Analiza ADVERSARIALMENTE este fragmento y encuentra UN bug REAL NUEVO. "
                 f"Responde SOLO JSON: {{\"hay_bug\":true|false,\"hipotesis\":\"<≤10 palabras>\",\"confianza\":0.0-1.0}}\n\n{code}")
         m["iter"] += 1
-        # (1) AUTO-CONSISTENCIA: 3 muestras del modelo chico; solo sobrevive lo que RECURRE (≥2/3).
         hyps = []
         for _ in range(CONSENSUS_N):
             o = call_provider(HUNTER, base, system=HUNTER_SYS, timeout=90)
@@ -341,11 +347,19 @@ def hunter_loop(tid):
         for h in hyps:
             groups.setdefault(norm(h), []).append(h)
         bkey = max(groups, key=lambda k: len(groups[k]))
-        if len(groups[bkey]) < QUORUM:   # sin consenso suficiente → alucinación (con cazador FIABLE, QUORUM=1 lo deja pasar)
+        if len(groups[bkey]) < QUORUM:
             m["clean"] += 1; _check_hardened(mod); continue
-        hip = groups[bkey][0]
-        # (2) El CHIQUITO CAZA la ventana que el escaneo LOCAL marcó (cheap, diverso, baja frecuencia).
-        # Usa SU hipótesis (más precisa que la del 9B); si la descarta, era ruido del local → no molesta a los fuertes.
+        suspectq.put({"module": mod, "path": path, "code": code, "hip": groups[bkey][0]})
+        ITER_TS[0] = time.time()
+
+def chiquito_loop(tid):
+    """TIER 1 — CHIQUITOS: consumen la cola de sospechosas y CAZAN ahí (cheap, diverso). Confirmados → bugq.
+    Frecuencia BAJA (solo sobre lo que el local marcó) → el overhead de CLI no molesta."""
+    while not STOP.is_set() and time.time() < DEADLINE:
+        try: s = suspectq.get(timeout=5)
+        except queue.Empty: continue
+        mod, path, code, hip = s["module"], s["path"], s["code"], s["hip"]
+        m = MEM[mod]
         if CHIQUITOS:
             with counter_lock:
                 chiq = CHIQUITOS[mod_counter[0] % len(CHIQUITOS)]
@@ -359,7 +373,7 @@ def hunter_loop(tid):
                     m["clean"] += 1; _check_hardened(mod); continue   # el chiquito descarta → ruido del local
                 hip = (cj.get("hipotesis") or hip).strip()            # hipótesis del chiquito (mejor)
             except Exception:
-                pass  # no parseó → sigue con la pista del local; los jueces fuertes filtran
+                pass
         key = hip.lower()[:60]
         with mem_lock:
             if key in m["queued_keys"] or any(key in t.lower() for t in m["tried"]):
@@ -370,8 +384,8 @@ def hunter_loop(tid):
             m["clean"] += 1; _check_hardened(mod); continue
         m["clean"] = 0
         bugq.put({"module": mod, "type": "code", "path": path, "hip": hip, "linea": "",
-                  "why": "consenso≥2/3 + refutación", "risk": risk_of(hip + " " + path)})
-        log(f"[H{tid}] {mod}: CONSENSO+refutado → {hip[:55]}  (cola={bugq.qsize()})")
+                  "why": "local-scan + chiquito", "risk": risk_of(hip + " " + path)})
+        log(f"[C{tid}] {mod}: chiquito confirmó → {hip[:55]}  (susp={suspectq.qsize()} cola={bugq.qsize()})")
         save_mem()
 
 def _check_hardened(mod):
@@ -524,7 +538,8 @@ def resolver_loop():
 def main():
     open(LOG, "a").write("\n" + "=" * 70 + f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} HARNESS NOCTURNO E2E · hunter={HUNTER} resolver={RESOLVER}\n" + "=" * 70 + "\n")
     load_mem(); save_status()
-    threads = [threading.Thread(target=hunter_loop, args=(i,), daemon=True) for i in range(N_HUNTERS)]
+    threads = [threading.Thread(target=scanner_loop, args=(i,), daemon=True) for i in range(N_SCANNERS)]   # LOCAL a full
+    threads += [threading.Thread(target=chiquito_loop, args=(i,), daemon=True) for i in range(N_CHIQUITO)] # chiquitos consumen
     threads.append(threading.Thread(target=e2e_loop, daemon=True))
     threads.append(threading.Thread(target=watchdog_loop, daemon=True))
     threads.append(threading.Thread(target=resolver_loop, daemon=True))

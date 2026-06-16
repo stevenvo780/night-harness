@@ -34,8 +34,8 @@ RESOLVER  = os.environ.get("LOOP_RESOLVER", "qwen3.5:9b")
 #   · JUEZ/triage  → alta frecuencia (1 por candidato) → modelo capaz pero BARATO (gemini -p).
 #   · FIXER        → baja frecuencia (solo bugs confirmados) → puede ser agéntico/caro (codex).
 #   · REVISOR      → rarísimo (solo fixes riesgosos) → cruce de familia.
-JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "gemini:gemini-3-pro-preview").split(",") if j.strip()]
-JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "1"))                       # 1 juez fuerte basta (sube a 2+ con más jueces si quieres panel)
+JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "claude:haiku,gemini:gemini-2.5-flash,gemini:gemini-3-pro-preview").split(",") if j.strip()]
+JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "2"))                       # ESCALERA: 2 baratos (haiku+flash) bastan; gemini-3-pro SOLO desempata; Codex/Opus aguas abajo
 FIXER     = os.environ.get("LOOP_FIXER", "codex")                           # FIXER (familia distinta al juez)
 REVIEWER  = os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview")  # revisa fixes RIESGOSOS (cruce de familia)
 ARBITER   = os.environ.get("LOOP_ARBITER", "claude:opus")                  # 🏆 EL MEJOR (Opus): ÁRBITRO FINAL, SOLO cuando el revisor DUDA (escalada) — rarísimo, máximo juicio por el costo
@@ -44,14 +44,16 @@ SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
 def gp(p): return os.path.join(SUBDIR, p) if SUBDIR else p  # path relativo al worktree, para git
 DEV_URL   = os.environ.get("LOOP_DEV_URL", "http://localhost:3011")
-RUNNER    = "/tmp/demeter-e2e-runner.js"
+RUNNER    = os.environ.get("LOOP_RUNNER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2e-runner.js"))
 LOG       = "/tmp/loop-nocturno.log"
 STATUS    = "/tmp/loop-nocturno-status.json"
 MEMFILE   = "/tmp/loop-memory.json"
 REVIEW    = "/tmp/loop-needs-review.json"
 
 TARGET_CLEAN = int(os.environ.get("LOOP_TARGET", "50"))
-N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "6"))  # el 9B caza a full (gratis); los jueces fuertes filtran
+N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "6"))  # el cazador caza a full; los jueces fuertes filtran
+CONSENSUS_N  = int(os.environ.get("LOOP_CONSENSUS", "3")) # muestras de auto-consistencia del CAZADOR
+QUORUM       = 2 if CONSENSUS_N >= 2 else 1               # acuerdos mínimos para pasar (1 si el cazador es FIABLE)
 WINDOW       = 150
 DEADLINE     = time.time() + float(os.environ.get("LOOP_HOURS", "8")) * 3600
 QMAX         = 40  # tope de cola para no sobreproducir
@@ -154,20 +156,26 @@ def call_provider(provider, prompt, timeout=150, system=None):
     except Exception as e:
         log(f"  [provider err {provider}] {e}"); return ""
 
-def judge_panel(desc, code, path):
-    """Panel DIVERSO: cada juez (familia distinta) vota REAL vs NOT_A_BUG. Confirmado si >= JUDGE_MIN votan REAL.
-    Esto SÍ sube la precisión (vs el consenso del mismo 9B, cuyos falsos positivos son sistemáticos/correlacionados)."""
+def judge_panel(desc, code, path, providers=None, min_votes=None, early_stop=True):
+    """Panel DIVERSO: cada votante (familia distinta) vota REAL vs NOT_A_BUG. Confirmado si >= min_votes votan REAL.
+    Reusable: por defecto usa JUDGES/JUDGE_MIN (la capa juez); se le pasa el ENJAMBRE cheap para el voto barato.
+    Diversidad de familias → errores no correlacionados → el acuerdo es señal real (vs auto-consenso del mismo modelo)."""
+    providers = providers if providers is not None else JUDGES
+    min_votes = min_votes if min_votes is not None else JUDGE_MIN
     q = (f"Eres revisor senior TS/Next.js/Drizzle. OJO: Drizzle PARAMETRIZA `sql${'{...}'}` (NO es inyección); "
          f"muchos null/división-por-cero ya están manejados; no inventes bugs. ¿Esta AFIRMACIÓN de bug es REAL en "
          f"el código? Responde SOLO una palabra: REAL o NOT_A_BUG.\n\nAFIRMACIÓN: {desc}\n\nARCHIVO {path}:\n{code[:7000]}")
     votes = []
-    for j in JUDGES:
-        o = call_provider(j, q, timeout=150).upper()
+    # Orden = ESCALERA de costo: pon los baratos primero (haiku, flash) y los caros al final (gemini-3-pro).
+    for idx, j in enumerate(providers):
+        o = call_provider(j, q, timeout=120).upper()
         v = "NOT_A_BUG" if "NOT_A_BUG" in o else ("REAL" if "REAL" in o else "?")
         votes.append(f"{j.split(':')[0]}={v}")
-        if sum(1 for x in votes if x.endswith("REAL")) >= JUDGE_MIN: break  # quórum alcanzado → no gastar más jueces
+        reales = sum(1 for x in votes if x.endswith("REAL"))
+        if early_stop and reales >= min_votes: break                                # ya confirmado → no escalar a los caros
+        if early_stop and reales + (len(providers) - idx - 1) < min_votes: break     # imposible alcanzar quórum → no gastar los caros
     reales = sum(1 for x in votes if x.endswith("REAL"))
-    return reales >= JUDGE_MIN, votes
+    return reales >= min_votes, votes
 
 # ----- helpers de archivo / git / e2e -----
 def read_window(path):
@@ -287,8 +295,8 @@ def hunter_loop(tid):
         m["iter"] += 1
         # (1) AUTO-CONSISTENCIA: 3 muestras del modelo chico; solo sobrevive lo que RECURRE (≥2/3).
         hyps = []
-        for _ in range(3):
-            o = call_model(HUNTER, base, system=HUNTER_SYS, npred=240, think=False, timeout=90)
+        for _ in range(CONSENSUS_N):
+            o = call_provider(HUNTER, base, system=HUNTER_SYS, timeout=90)
             try:
                 jj = json.loads(o[o.index("{"):o.rindex("}") + 1])
             except Exception:
@@ -303,12 +311,12 @@ def hunter_loop(tid):
         for h in hyps:
             groups.setdefault(norm(h), []).append(h)
         bkey = max(groups, key=lambda k: len(groups[k]))
-        if len(groups[bkey]) < 2:   # 3 hipótesis distintas → sin consenso → casi seguro alucinación
+        if len(groups[bkey]) < QUORUM:   # sin consenso suficiente → alucinación (con cazador FIABLE, QUORUM=1 lo deja pasar)
             m["clean"] += 1; _check_hardened(mod); continue
         hip = groups[bkey][0]
         # (2) REFUTACIÓN: un segundo pase ESCÉPTICO intenta tumbar la hipótesis.
-        rf = call_model(HUNTER, f"CÓDIGO:\n{code}\n\nAfirmación de bug: «{hip}». Sé ESCÉPTICO: ¿el código YA lo maneja, o la afirmación es falsa? Responde SOLO JSON {{\"real\":true|false}}.",
-                        system=HUNTER_SYS, npred=60, think=False, timeout=60)
+        rf = call_provider(HUNTER, f"CÓDIGO:\n{code}\n\nAfirmación de bug: «{hip}». Sé ESCÉPTICO: ¿el código YA lo maneja, o la afirmación es falsa? Responde SOLO JSON {{\"real\":true|false}}.",
+                           system=HUNTER_SYS, timeout=60)
         try:
             if not json.loads(rf[rf.index("{"):rf.rindex("}") + 1]).get("real"):
                 m["clean"] += 1; _check_hardened(mod); continue

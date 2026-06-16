@@ -27,6 +27,18 @@ HUNTER    = os.environ.get("LOOP_HUNTER", "qwen3.5:9b")
 # residentes (RAM suficiente + OLLAMA_MAX_LOADED_MODELS>=2 + OLLAMA_KEEP_ALIVE largo) o córrelo en
 # una FASE separada (sin interleave con el chico). Ver README §"Contención de modelos".
 RESOLVER  = os.environ.get("LOOP_RESOLVER", "qwen3.5:9b")
+# --- CAPAS DIVERSAS (v3): el 9B local CAZA; modelos fuertes de FAMILIAS DISTINTAS en FINES distintos ---
+# No se ponen a votar lo mismo (quemaría cuota doble): cada uno en su capa, y aún diversifica porque el
+# JUEZ y el FIXER son familias distintas que se cruzan + el gate objetivo (tsc/E2E). Remotos → SIN contención
+# con el 9B local (mata el wedge). Quotas separadas: aprovechan Gemini/Codex ociosos sin gastar Claude.
+#   · JUEZ/triage  → alta frecuencia (1 por candidato) → modelo capaz pero BARATO (gemini -p).
+#   · FIXER        → baja frecuencia (solo bugs confirmados) → puede ser agéntico/caro (codex).
+#   · REVISOR      → rarísimo (solo fixes riesgosos) → cruce de familia.
+JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "gemini:gemini-3-pro-preview").split(",") if j.strip()]
+JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "1"))                       # 1 juez fuerte basta (sube a 2+ con más jueces si quieres panel)
+FIXER     = os.environ.get("LOOP_FIXER", "codex")                           # FIXER (familia distinta al juez)
+REVIEWER  = os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview")  # revisa fixes RIESGOSOS (cruce de familia)
+ARBITER   = os.environ.get("LOOP_ARBITER", "claude:opus")                  # 🏆 EL MEJOR (Opus): ÁRBITRO FINAL, SOLO cuando el revisor DUDA (escalada) — rarísimo, máximo juicio por el costo
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -39,7 +51,7 @@ MEMFILE   = "/tmp/loop-memory.json"
 REVIEW    = "/tmp/loop-needs-review.json"
 
 TARGET_CLEAN = int(os.environ.get("LOOP_TARGET", "50"))
-N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "4"))
+N_HUNTERS    = int(os.environ.get("LOOP_HUNTERS", "6"))  # el 9B caza a full (gratis); los jueces fuertes filtran
 WINDOW       = 150
 DEADLINE     = time.time() + float(os.environ.get("LOOP_HOURS", "8")) * 3600
 QMAX         = 40  # tope de cola para no sobreproducir
@@ -117,6 +129,45 @@ def call_model(model, prompt, system=None, npred=600, think=None, timeout=120):
         return ""
 
 def risk_of(text): return "alto" if RISK_RE.search(text or "") else "bajo"
+
+def _strip(s):
+    """Quita ruido de los CLIs (warnings de gemini, footer 'tokens used' de codex)."""
+    s = re.sub(r"(?im)^.*Ripgrep is not available.*$", "", s or "")
+    s = re.sub(r"(?is)\ntokens used\s*\n[\d,]+\s*", "\n", s)
+    return s.strip()
+
+def call_provider(provider, prompt, timeout=150, system=None):
+    """Enruta a un proveedor DIVERSO: gemini:<model> | codex | claude:<model> | ollama:<model> | <modelo-ollama>."""
+    full = (system + "\n\n" + prompt) if system else prompt
+    try:
+        if provider.startswith("gemini:"):
+            p = subprocess.run(["gemini", "-m", provider.split(":", 1)[1], "-p", full], capture_output=True, text=True, timeout=timeout)
+            return _strip(p.stdout)
+        if provider.split(":")[0] == "codex":
+            p = subprocess.run(["codex", "exec", full], capture_output=True, text=True, timeout=timeout)
+            return _strip(p.stdout)
+        if provider.startswith("claude:"):
+            p = subprocess.run(["claude", "-p", full, "--model", provider.split(":", 1)[1]], capture_output=True, text=True, timeout=timeout)
+            return _strip(p.stdout)
+        model = provider.split(":", 1)[1] if provider.startswith("ollama:") else provider
+        return call_model(model, prompt, system=system, timeout=timeout, think=False)
+    except Exception as e:
+        log(f"  [provider err {provider}] {e}"); return ""
+
+def judge_panel(desc, code, path):
+    """Panel DIVERSO: cada juez (familia distinta) vota REAL vs NOT_A_BUG. Confirmado si >= JUDGE_MIN votan REAL.
+    Esto SÍ sube la precisión (vs el consenso del mismo 9B, cuyos falsos positivos son sistemáticos/correlacionados)."""
+    q = (f"Eres revisor senior TS/Next.js/Drizzle. OJO: Drizzle PARAMETRIZA `sql${'{...}'}` (NO es inyección); "
+         f"muchos null/división-por-cero ya están manejados; no inventes bugs. ¿Esta AFIRMACIÓN de bug es REAL en "
+         f"el código? Responde SOLO una palabra: REAL o NOT_A_BUG.\n\nAFIRMACIÓN: {desc}\n\nARCHIVO {path}:\n{code[:7000]}")
+    votes = []
+    for j in JUDGES:
+        o = call_provider(j, q, timeout=150).upper()
+        v = "NOT_A_BUG" if "NOT_A_BUG" in o else ("REAL" if "REAL" in o else "?")
+        votes.append(f"{j.split(':')[0]}={v}")
+        if sum(1 for x in votes if x.endswith("REAL")) >= JUDGE_MIN: break  # quórum alcanzado → no gastar más jueces
+    reales = sum(1 for x in votes if x.endswith("REAL"))
+    return reales >= JUDGE_MIN, votes
 
 # ----- helpers de archivo / git / e2e -----
 def read_window(path):
@@ -365,23 +416,18 @@ def resolver_loop():
             desc = f"En la ruta {bug['route']} el navegador detectó: {' | '.join(bug['errors'])}. Encuentra y corrige la causa en este archivo del módulo {bug['module']}."
         else:
             desc = f"Bug: {bug['hip']}. Indicio: {bug.get('linea','')[:160]}. Por qué: {bug.get('why','')}"
-        triage = ("PRIMERO juzga con RIGOR si es un bug REAL en ESTE archivo. Ojo: Drizzle PARAMETRIZA `sql${'{...}'}` "
-                  "(NO es inyección); muchos 'nulls'/'divisiones por cero' ya están manejados. Si NO es un bug real, o el "
-                  "código ya es correcto, o la causa no está en este archivo → responde EXACTAMENTE: NOT_A_BUG. "
-                  if bug["type"] == "code" else
-                  "El error de navegador es evidencia REAL. Si la causa está en este archivo corrígela; si claramente "
-                  "NO está aquí → responde EXACTAMENTE: NOT_A_BUG. ")
-        prompt = (f"{desc}\n\nArchivo `{path}`. {triage}\n"
-                  f"Si SÍ hay que arreglarlo, devuelve SOLO la edición quirúrgica (OLD = copia EXACTA y única del código actual):\n"
-                  f"<<<OLD>>>\n<código exacto>\n<<<NEW>>>\n<código corregido>\n<<<END>>>\n\nCÓDIGO:\n{ctx}")
-        if BIG_RESOLVER and not wait_for_model(RESOLVER):
-            continue  # resolver grande no disponible tras esperar con backoff → pasa al siguiente bug
-        out = call_model(RESOLVER, prompt, system=RESOLVER_SYS, npred=450, timeout=280, think=False)
-        if "NOT_A_BUG" in out and "<<<OLD>>>" not in out:
+        # CAPA 1 — TRIAGE por JUEZ fuerte de OTRA familia (Gemini, alta frecuencia/barato). Sin contención local.
+        is_real, votes = judge_panel(desc, ctx, path)
+        if not is_real:
             MEM[bug["module"]]["rejected"] += 1
-            log(f"[R] {bug['module']}: triage → NO es bug ({(bug.get('hip') or bug.get('route') or '')[:45]})"); continue
+            log(f"[R] {bug['module']}: juez → NO es bug [{', '.join(votes)}] ({(bug.get('hip') or bug.get('route') or '')[:40]})"); continue
+        # CAPA 2 — FIX por el FIXER (Codex, baja frecuencia: solo bugs confirmados)
+        fixprompt = (f"{desc}\n\nArchivo `{path}`. Es un bug REAL confirmado. Devuelve SOLO la edición quirúrgica "
+                     f"(OLD = copia EXACTA y ÚNICA del código actual; cambio mínimo, no rompas nada):\n"
+                     f"<<<OLD>>>\n<código exacto>\n<<<NEW>>>\n<código corregido>\n<<<END>>>\n\nCÓDIGO:\n{ctx}")
+        out = call_provider(FIXER, fixprompt, timeout=240)
         if "<<<OLD>>>" not in out or "<<<NEW>>>" not in out:
-            MEM[bug["module"]]["rejected"] += 1; continue
+            MEM[bug["module"]]["rejected"] += 1; log(f"[R] {bug['module']}: el fixer ({FIXER.split(':')[0]}) no produjo edición"); continue
         try:
             old = out.split("<<<OLD>>>", 1)[1].split("<<<NEW>>>", 1)[0].strip("\n")
             new = out.split("<<<NEW>>>", 1)[1].split("<<<END>>>", 1)[0].strip("\n")
@@ -408,13 +454,21 @@ def resolver_loop():
             diff = git("diff", "--cached", "--", gp(path)).stdout
             msg = f"fix({bug['module']}): {bug.get('hip') or bug.get('route')} [local]"
             git("commit", "-q", "-m", msg)
-        # revisión Opus para riesgosos (fuera del lock; ya commiteado en rama)
-        if bug["risk"] == "alto":
-            verdict = opus_review(desc, diff)
-            entry = {"module": bug["module"], "desc": desc[:200], "commit": git("rev-parse", "--short", "HEAD").stdout.strip(), "opus": verdict, "ts": now()}
+        # CAPA 3 — REVISIÓN de fixes RIESGOSOS por modelo de OTRA familia (cruce; rarísimo, no gasta Claude)
+        if bug["risk"] == "alto" and REVIEWER:
+            rq = (f"Revisa este diff de un fix a un bug de RIESGO (dinero/stock/estado/auth). ¿Es CORRECTO y SEGURO "
+                  f"sin romper nada? Responde una línea: OK | DUDOSO | MAL + motivo.\n\nBUG: {desc}\n\nDIFF:\n{diff[:6000]}")
+            verdict = call_provider(REVIEWER, rq, timeout=150)[:300]
+            # ESCALADA AL ÁRBITRO (Opus) SOLO si el revisor DUDA o lo marca mal → caso difícil que merece al mejor
+            arbiter = ""
+            if ARBITER and re.search(r"DUDOSO|MAL|incorrect|unsafe|riesg", verdict, re.I):
+                arbiter = call_provider(ARBITER, rq + f"\n\nUn revisor previo dictaminó: «{verdict}». Da el VEREDICTO FINAL (OK|MAL + por qué).", timeout=200)[:300]
+                log(f"[R] {bug['module']}: ⚖️ ESCALADO a Opus (árbitro): {arbiter[:70]}")
+            entry = {"module": bug["module"], "desc": desc[:200], "commit": git("rev-parse", "--short", "HEAD").stdout.strip(),
+                     "review": verdict, "arbiter_opus": arbiter, "ts": now()}
             rev = json.load(open(REVIEW)) if os.path.exists(REVIEW) else []
             rev.append(entry); json.dump(rev, open(REVIEW, "w"), ensure_ascii=False, indent=1)
-            log(f"[R] {bug['module']}: FIX riesgoso commiteado + Opus: {verdict[:80]}")
+            log(f"[R] {bug['module']}: FIX riesgoso + revisión {REVIEWER.split(':')[0]}: {verdict[:70]}")
         else:
             log(f"[R] {bug['module']}: FIX commiteado «{(bug.get('hip') or bug.get('route'))[:50]}»")
         MEM[bug["module"]]["fixed"].append(bug.get("hip") or bug.get("route"))

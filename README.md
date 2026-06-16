@@ -29,6 +29,27 @@ no introdujo ni un fix erróneo.
 
 ---
 
+## Capas diversas (v3): cada modelo donde brilla, sin duplicar cuota
+
+El consenso del MISMO 9B no sube la precisión (sus falsos positivos son **sistemáticos/correlacionados**:
+"falta null", "falta tenant", "inyección"… que el código ya maneja → 3 muestras del mismo modelo coinciden
+en el error). Lo que SÍ funciona: **diversidad de FAMILIAS en CAPAS distintas**, cada una a frecuencia
+inversa a su costo:
+
+| Capa | Modelo (def.) | Frecuencia | Por qué |
+|---|---|---|---|
+| **Cazar** | 9B local | altísima (gratis) | genera candidatos baratos |
+| **Triage** | Gemini 3 Pro | alta (1/candidato) | juez capaz y barato (`-p`) |
+| **Arreglar** | Codex | media (confirmados) | fixer agéntico, familia distinta |
+| **Revisar** | Gemini | baja (riesgosos) | cruce de familia sobre el diff |
+| **🏆 Árbitro** | Opus | rarísima (escaladas) | el mejor — solo cuando el revisor DUDA |
+
+Validado con datos: ante un falso positivo típico del 9B y un bug real, Gemini 3 Pro y Codex acertaron
+**2/2** cada uno (el 9B solo no distinguía). No se ponen a **votar lo mismo** (duplicaría cuota): el JUEZ
+y el FIXER ya son familias distintas que se cruzan + el gate objetivo (`tsc`+E2E). Opus = corte suprema:
+solo los casos difíciles. Todos **remotos → cero contención** con el 9B (mata el wedge de memoria de la 1ª
+noche). Cuotas separadas → aprovechan Gemini/Codex ociosos casi sin tocar Claude.
+
 ## Arquitectura (pipeline productor–consumidor)
 
 ```
@@ -76,8 +97,10 @@ una fase "solo-fix" con el grande sin interleave con el chico. No los alternes r
 
 ## Requisitos
 
-- **Ollama** accesible (local o por túnel) con al menos un modelo de código (`qwen3.5:9b` va de
-  sobra para hunter+resolver). Opcional `claude` CLI para la revisión Opus.
+- **Ollama** con un modelo chico de código para el CAZADOR (`qwen3.5:9b`).
+- **CLIs de modelos fuertes DIVERSOS** (v3, recomendado): `gemini` (juez/revisor) + `codex` (fixer),
+  cada uno en su CAPA → no duplica cuota. Remotos → **cero contención** con el 9B local. `claude` CLI
+  también enchufable. Sin ellos, todo cae al local (`LOOP_FIXER=ollama:<modelo>`, `LOOP_JUDGES=ollama:<modelo>`).
 - El **repo objetivo** (Next.js + TypeScript + Drizzle, o adapta) con `npm run typecheck`/`build`.
 - **DB de test AISLADA** (Postgres local con el esquema completo) para el dev server del E2E — NUNCA
   apuntes el E2E a producción (muta datos). Playwright + chromium instalados.
@@ -103,8 +126,13 @@ LOOP_WT=/tmp/wt LOOP_SUBDIR=apps/dashboard LOOP_DYNAMIC_ID=<un-id-real-de-tu-db-
 |---|---|---|
 | `LOOP_BASE` | `http://host.docker.internal:11434` | endpoint de Ollama |
 | `LOOP_HUNTER` | `qwen3.5:9b` | modelo cazador (rápido) |
-| `LOOP_RESOLVER` | `qwen3.5:9b` | modelo que arregla (ver lección de contención) |
-| `LOOP_HUNTERS` | `4` | hilos cazadores |
+| `LOOP_HUNTERS` | `6` | hilos cazadores (el 9B caza a full; los fuertes filtran) |
+| **`LOOP_JUDGES`** | `gemini:gemini-3-pro-preview` | **triage** REAL vs NOT_A_BUG (coma-separado = panel) |
+| `LOOP_JUDGE_MIN` | `1` | votos REAL para confirmar (2+ si pones panel) |
+| **`LOOP_FIXER`** | `codex` | **fixer** (familia distinta al juez) |
+| `LOOP_REVIEWER` | `gemini:gemini-3-pro-preview` | revisor de fixes riesgosos |
+| **`LOOP_ARBITER`** | `claude:opus` | 🏆 árbitro final, SOLO en escaladas por duda |
+| `LOOP_RESOLVER` | `qwen3.5:9b` | (legado) local si usas `LOOP_FIXER=ollama:…` |
 | `LOOP_TARGET` | `50` | rondas limpias para "endurecer" un módulo |
 | `LOOP_HOURS` | `8` | deadline duro |
 | `LOOP_DEV_URL` | `http://localhost:3011` | dev server para el crawl E2E |

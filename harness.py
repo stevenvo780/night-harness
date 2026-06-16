@@ -51,6 +51,7 @@ CODEX_EFFORT = os.environ.get("LOOP_CODEX_EFFORT", "low")
 # una sola vez). "" para desactivar. Sus hallazgos van directo a bugq (panel de jueces fuertes los cruza).
 AUDITOR = os.environ.get("LOOP_AUDITOR", "qwen3-coder-next:cpu")
 AUDITOR_KEEPALIVE = os.environ.get("LOOP_AUDITOR_KEEPALIVE", "180m")
+AUDITOR_SELFCHECK = os.environ.get("LOOP_AUDITOR_SELFCHECK", "1") != "0"  # 80B re-verifica su propio hallazgo (gratis) antes de gastar juez cloud
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -588,9 +589,23 @@ def auditor_loop():
         with mem_lock:
             if key in m["queued_keys"] or any(key in t.lower() for t in m["tried"]): continue
             m["tried"].append(hip); m["queued_keys"].append(key)
+        # AUTO-CHEQUEO local (GRATIS, más CPU local): el 80B re-examina su PROPIO hallazgo con escepticismo
+        # máximo ANTES de gastar un juez cloud. Si ni él lo sostiene → descarta (no escala). Los bugs REALES
+        # los mantiene → sí escalan. Corta falsos positivos sin perder reales y ahorra cuota cloud.
+        if AUDITOR_SELFCHECK:
+            vprompt = (f"Marcaste un posible bug: «{hip}» en `{path}`. RE-EXAMINA con escepticismo MÁXIMO: ¿el código "
+                       f"YA lo maneja (null/await/validación/scope)? ¿es de verdad un bug serio y accionable o un falso "
+                       f"positivo? Ante CUALQUIER duda o si ya está cubierto → confirmado:false. Solo true si estás "
+                       f"SEGURO. Responde SOLO JSON {{\"confirmado\":true|false}}.\n\n{code}")
+            vout = call_model(AUDITOR, vprompt, system=HUNTER_SYS, npred=80, think=False, timeout=240, keep_alive=AUDITOR_KEEPALIVE)
+            try:
+                if not json.loads(vout[vout.index("{"):vout.rindex("}") + 1]).get("confirmado"):
+                    log(f"[A80] {mod}: auto-descartó (no se sostiene) → {hip[:45]}"); continue
+            except Exception:
+                continue   # sin confirmación clara → conservador: no molesta al juez cloud
         bugq.put({"module": mod, "type": "code", "path": path, "hip": hip, "linea": "",
-                  "why": "auditor 80B (profundo)", "risk": risk_of(hip + " " + path)})
-        log(f"[A80] {mod}: auditor profundo → {hip[:55]}  (cola={bugq.qsize()})")
+                  "why": "auditor 80B (auto-verificado)", "risk": risk_of(hip + " " + path)})
+        log(f"[A80] {mod}: auditor (auto-verificado) → {hip[:50]}  (cola={bugq.qsize()})")
         save_mem()
 
 # ----- main -----

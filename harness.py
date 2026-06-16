@@ -43,6 +43,9 @@ JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "2"))                       # E
 FIXER_CHAIN    = [x.strip() for x in os.environ.get("LOOP_FIXER", "codex,gemini:gemini-3-pro-preview,claude:sonnet,qwen3-coder:30b-32k").split(",") if x.strip()]  # Codex (dura MENOS) → Gemini Pro → Claude (fiable) → local
 REVIEWER_CHAIN = [x.strip() for x in os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview,claude:sonnet").split(",") if x.strip()]                          # revisa riesgosos; fallback Claude
 ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus,gemini:gemini-3-pro-preview,claude:sonnet").split(",") if x.strip()]              # 🏆 Opus → Gemini Pro → Claude Sonnet (fiable)
+# Codex es la cuota MÁS escasa (cuenta ChatGPT: solo gpt-5.5, sin mini, ~quota/5h). El default xhigh quema
+# muchísimo por llamada; un veredicto REAL/NOT_A_BUG no lo necesita → effort bajo estira la cuota a más llamadas.
+CODEX_EFFORT = os.environ.get("LOOP_CODEX_EFFORT", "low")
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -169,7 +172,8 @@ def call_provider(provider, prompt, timeout=150, system=None):
         if provider.startswith("gemini:"):
             text, raw = _run_cli(["gemini", "-m", provider.split(":", 1)[1], "-p", full], timeout)
         elif provider.split(":")[0] == "codex":
-            cmd = ["codex", "exec"] + (["-m", provider.split(":", 1)[1]] if ":" in provider else []) + [full]
+            cmd = ["codex", "exec", "-c", f"model_reasoning_effort={CODEX_EFFORT}"] \
+                  + (["-m", provider.split(":", 1)[1]] if ":" in provider else []) + [full]
             text, raw = _run_cli(cmd, timeout)
         elif provider.startswith("claude:"):
             text, raw = _run_cli(["claude", "-p", full, "--model", provider.split(":", 1)[1]], timeout)

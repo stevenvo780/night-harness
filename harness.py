@@ -361,22 +361,21 @@ def chiquito_loop(tid):
         mod, path, code, hip = s["module"], s["path"], s["code"], s["hip"]
         m = MEM[mod]
         if CHIQUITOS:
-            with counter_lock:
-                chiq = CHIQUITOS[mod_counter[0] % len(CHIQUITOS)]
-            ch = call_provider(chiq,
-                f"Un escáner local RUIDOSO (suele ALUCINAR) sospecha de esta ventana (pista: «{hip}»). Sé ESCÉPTICO y "
+            qprompt = (f"Un escáner local RUIDOSO (suele ALUCINAR) sospecha de esta ventana (pista: «{hip}»). Sé ESCÉPTICO y "
                 f"RIGUROSO: la MAYORÍA de estas pistas son FALSAS — el código suele YA manejar el caso (null/empty/await), "
                 f"Drizzle PARAMETRIZA sql${'{...}'} (no es inyección), etc. ¿Hay de verdad un bug REAL, concreto y accionable "
                 f"AQUÍ? Ante la duda o si el código ya lo maneja → hay_bug:false. Solo di true si estás SEGURO. "
-                f"Responde SOLO JSON {{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras, solo si REAL>\"}}.\n\n{code}",
-                system=HUNTER_SYS, timeout=120)
+                f"Responde SOLO JSON {{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras, solo si REAL>\"}}.\n\n{code}")
+            ch, _ = call_chain(CHIQUITOS, qprompt, timeout=120, system=HUNTER_SYS)  # fallback entre chiquitos si uno agotado
+            confirmed = False
             try:
                 cj = json.loads(ch[ch.index("{"):ch.rindex("}") + 1])
-                if not cj.get("hay_bug"):
-                    m["clean"] += 1; _check_hardened(mod); continue   # el chiquito descarta → ruido del local
-                hip = (cj.get("hipotesis") or hip).strip()            # hipótesis del chiquito (mejor)
+                if cj.get("hay_bug"):
+                    confirmed = True; hip = (cj.get("hipotesis") or hip).strip()  # hipótesis del chiquito (mejor)
             except Exception:
-                pass
+                confirmed = False
+            if not confirmed:   # el filtro NO confirmó (o NINGÚN chiquito disponible por cuota) → NO pasar ruido sin filtrar
+                m["clean"] += 1; _check_hardened(mod); continue
         key = hip.lower()[:60]
         with mem_lock:
             if key in m["queued_keys"] or any(key in t.lower() for t in m["tried"]):

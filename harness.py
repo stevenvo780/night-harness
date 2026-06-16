@@ -46,10 +46,12 @@ ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus
 # Codex es la cuota MÁS escasa (cuenta ChatGPT: solo gpt-5.5, sin mini, ~quota/5h). El default xhigh quema
 # muchísimo por llamada; un veredicto REAL/NOT_A_BUG no lo necesita → effort bajo estira la cuota a más llamadas.
 CODEX_EFFORT = os.environ.get("LOOP_CODEX_EFFORT", "low")
-# AUDITOR PROFUNDO local: el 80B (qwen3-coder-next, ~calidad Sonnet) corre DECOUPLED, fuera del camino crítico.
-# Lento (~6 tok/s CPU) pero gratis y fuerte → aprovecha CPU ociosa + ahorra cuota. Pinneado residente (carga 60GB
-# una sola vez). "" para desactivar. Sus hallazgos van directo a bugq (panel de jueces fuertes los cruza).
-AUDITOR = os.environ.get("LOOP_AUDITOR", "qwen3-coder-next:cpu")
+# AUDITOR PROFUNDO local: coder fuerte corriendo DECOUPLED, fuera del camino crítico (aprovecha CPU ociosa +
+# ahorra cuota; pinneado residente, carga 1 sola vez). Sus hallazgos → bugq (jueces fuertes los cruzan). "" desactiva.
+# DEFAULT = 30B (18GB): cabe con margen junto al 9B + dev-server. El 80B `qwen3-coder-next:cpu` (~Sonnet, 60GB) da
+# MEJOR calidad PERO solo cabe en cajas grandes con dev-server delgado — si no, el dev-server inflado (~30GB) lo
+# empuja a SWAP y wedgea al 9B. Para usar el 80B: cárgalo PRIMERO en ventana quieta (parar harness) y pinnéalo.
+AUDITOR = os.environ.get("LOOP_AUDITOR", "qwen3-coder:30b-32k")
 AUDITOR_KEEPALIVE = os.environ.get("LOOP_AUDITOR_KEEPALIVE", "180m")
 AUDITOR_SELFCHECK = os.environ.get("LOOP_AUDITOR_SELFCHECK", "1") != "0"  # 80B re-verifica su propio hallazgo (gratis) antes de gastar juez cloud
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)

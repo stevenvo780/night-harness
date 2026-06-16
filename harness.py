@@ -34,12 +34,15 @@ RESOLVER  = os.environ.get("LOOP_RESOLVER", "qwen3.5:9b")
 #   · JUEZ/triage  → alta frecuencia (1 por candidato) → modelo capaz pero BARATO (gemini -p).
 #   · FIXER        → baja frecuencia (solo bugs confirmados) → puede ser agéntico/caro (codex).
 #   · REVISOR      → rarísimo (solo fixes riesgosos) → cruce de familia.
-JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "claude:haiku,gemini:gemini-2.5-flash,gemini:gemini-3-pro-preview,qwen3-coder:30b-32k").split(",") if j.strip()]  # último = local (fallback si toda la nube se agota)
+# CAZADORES baratos (chiquitos): cazan sobre las ventanas que el escaneo LOCAL marcó (se consumen PRIMERO).
+CHIQUITOS = [c.strip() for c in os.environ.get("LOOP_CHIQUITOS", "claude:haiku,gemini:gemini-2.5-flash").split(",") if c.strip()]
+# JUECES FUERTES (solo sobre lo que los chiquitos confirman). Orden barato→caro; termina en local de respaldo.
+JUDGES    = [j.strip() for j in os.environ.get("LOOP_JUDGES", "gemini:gemini-3-pro-preview,codex,claude:sonnet,qwen3-coder:30b-32k").split(",") if j.strip()]
 JUDGE_MIN = int(os.environ.get("LOOP_JUDGE_MIN", "2"))                       # ESCALERA: 2 baratos (haiku+flash) bastan; gemini-3-pro SOLO desempata; Codex/Opus aguas abajo
 # Cada rol es una CADENA de fallback (orden = preferencia): si el 1º se agota por cuota, usa el siguiente.
-FIXER_CHAIN    = [x.strip() for x in os.environ.get("LOOP_FIXER", "codex,gemini:gemini-3-pro-preview,qwen3-coder:30b-32k").split(",") if x.strip()]  # Codex (dura MENOS) → Gemini Pro → local
-REVIEWER_CHAIN = [x.strip() for x in os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview,claude:haiku").split(",") if x.strip()]            # revisa riesgosos; fallback
-ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus,gemini:gemini-3-pro-preview").split(",") if x.strip()]              # 🏆 Opus; fallback Gemini Pro si Claude agotado
+FIXER_CHAIN    = [x.strip() for x in os.environ.get("LOOP_FIXER", "codex,gemini:gemini-3-pro-preview,claude:sonnet,qwen3-coder:30b-32k").split(",") if x.strip()]  # Codex (dura MENOS) → Gemini Pro → Claude (fiable) → local
+REVIEWER_CHAIN = [x.strip() for x in os.environ.get("LOOP_REVIEWER", "gemini:gemini-3-pro-preview,claude:sonnet").split(",") if x.strip()]                          # revisa riesgosos; fallback Claude
+ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus,gemini:gemini-3-pro-preview,claude:sonnet").split(",") if x.strip()]              # 🏆 Opus → Gemini Pro → Claude Sonnet (fiable)
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -341,14 +344,22 @@ def hunter_loop(tid):
         if len(groups[bkey]) < QUORUM:   # sin consenso suficiente → alucinación (con cazador FIABLE, QUORUM=1 lo deja pasar)
             m["clean"] += 1; _check_hardened(mod); continue
         hip = groups[bkey][0]
-        # (2) REFUTACIÓN: un segundo pase ESCÉPTICO intenta tumbar la hipótesis.
-        rf = call_provider(HUNTER, f"CÓDIGO:\n{code}\n\nAfirmación de bug: «{hip}». Sé ESCÉPTICO: ¿el código YA lo maneja, o la afirmación es falsa? Responde SOLO JSON {{\"real\":true|false}}.",
-                           system=HUNTER_SYS, timeout=60)
-        try:
-            if not json.loads(rf[rf.index("{"):rf.rindex("}") + 1]).get("real"):
-                m["clean"] += 1; _check_hardened(mod); continue
-        except Exception:
-            pass  # si no parsea, lo deja pasar (el triage del 80B es el backstop final)
+        # (2) El CHIQUITO CAZA la ventana que el escaneo LOCAL marcó (cheap, diverso, baja frecuencia).
+        # Usa SU hipótesis (más precisa que la del 9B); si la descarta, era ruido del local → no molesta a los fuertes.
+        if CHIQUITOS:
+            with counter_lock:
+                chiq = CHIQUITOS[mod_counter[0] % len(CHIQUITOS)]
+            ch = call_provider(chiq,
+                f"El escaneo LOCAL marcó esta ventana como sospechosa (pista: «{hip}»). CAZA el bug REAL aquí; si está "
+                f"limpio, dilo. Responde SOLO JSON {{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras>\"}}.\n\n{code}",
+                system=HUNTER_SYS, timeout=120)
+            try:
+                cj = json.loads(ch[ch.index("{"):ch.rindex("}") + 1])
+                if not cj.get("hay_bug"):
+                    m["clean"] += 1; _check_hardened(mod); continue   # el chiquito descarta → ruido del local
+                hip = (cj.get("hipotesis") or hip).strip()            # hipótesis del chiquito (mejor)
+            except Exception:
+                pass  # no parseó → sigue con la pista del local; los jueces fuertes filtran
         key = hip.lower()[:60]
         with mem_lock:
             if key in m["queued_keys"] or any(key in t.lower() for t in m["tried"]):

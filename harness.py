@@ -173,9 +173,13 @@ def call_provider(provider, prompt, timeout=150, system=None):
             text, raw = _run_cli(cmd, timeout)
         elif provider.startswith("claude:"):
             text, raw = _run_cli(["claude", "-p", full, "--model", provider.split(":", 1)[1]], timeout)
-        else:  # ollama LOCAL: sin cuota, no se agota
+        else:  # ollama LOCAL: sin cuota, PERO se cae por CONTENCIÓN de memoria (modelo pesado evicta a otro → timeout)
             model = provider.split(":", 1)[1] if provider.startswith("ollama:") else provider
-            return call_model(model, prompt, system=system, timeout=timeout, think=False)
+            t0 = time.time()
+            out = call_model(model, prompt, system=system, timeout=timeout, think=False)
+            if not out and time.time() - t0 >= timeout * 0.85:  # timeout real (no vacío rápido) → contención → cuarentena
+                _mark_dead(provider, "timeout local (contención de memoria) — cae a cloud")
+            return out
         if not text and QUOTA_RE.search(raw): _mark_dead(provider, raw)
         return text
     except Exception as e:

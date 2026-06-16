@@ -29,26 +29,29 @@ no introdujo ni un fix erróneo.
 
 ---
 
-## Capas diversas (v3): cada modelo donde brilla, sin duplicar cuota
+## Pirámide de costo (v5): cada modelo donde brilla, consumiendo barato primero
 
-El consenso del MISMO 9B no sube la precisión (sus falsos positivos son **sistemáticos/correlacionados**:
-"falta null", "falta tenant", "inyección"… que el código ya maneja → 3 muestras del mismo modelo coinciden
-en el error). Lo que SÍ funciona: **diversidad de FAMILIAS en CAPAS distintas**, cada una a frecuencia
-inversa a su costo:
+Lecciones a fuego: el consenso del MISMO modelo chico NO sube precisión (sus falsos positivos son
+**sistemáticos/correlacionados**); y los CLI cloud tienen overhead de arranque → sirven para **JUZGAR**
+(baja frecuencia), no para CAZAR a alta frecuencia. La solución: una **escalera de costo** con familias
+diversas en capas distintas, **desacoplada por colas**, consumiendo siempre lo más barato primero:
 
-| Capa | Modelo (def.) | Frecuencia | Por qué |
+| Tier | Modelo (def.) | Frecuencia | Rol |
 |---|---|---|---|
-| **Cazar** | 9B local | altísima (gratis) | genera candidatos baratos |
-| **Triage** | Gemini 3 Pro | alta (1/candidato) | juez capaz y barato (`-p`) |
-| **Arreglar** | Codex | media (confirmados) | fixer agéntico, familia distinta |
-| **Revisar** | Gemini | baja (riesgosos) | cruce de familia sobre el diff |
-| **🏆 Árbitro** | Opus | rarísima (escaladas) | el mejor — solo cuando el revisor DUDA |
+| **0 · Escáner** | **9B LOCAL** (N hilos, HTTP) | altísima (gratis) | escanea TODO a full (consenso) → marca ventanas sospechosas → `suspectq` |
+| **1 · Filtro** | chiquitos: **Haiku + Gemini-Flash** | media (solo sospechosas) | filtran ESCÉPTICAMENTE el ruido del local; lo sólido → `bugq` |
+| **2 · Jueces** | **Gemini-3-Pro + Codex + Sonnet + 30b-local** | baja (solo confirmado) | REAL vs NOT_A_BUG; escalera barato→caro que corta al confirmar o al ser imposible |
+| **3 · Fixer** | **Codex** → Gemini-Pro → Claude → local | rara (bugs reales) | genera el fix → gate `tsc`+E2E → commit |
+| **4 · Árbitro** | 🏆 **Opus** → Gemini-Pro → Sonnet | rarísima (riesgoso+contestado) | veredicto final |
 
-Validado con datos: ante un falso positivo típico del 9B y un bug real, Gemini 3 Pro y Codex acertaron
-**2/2** cada uno (el 9B solo no distinguía). No se ponen a **votar lo mismo** (duplicaría cuota): el JUEZ
-y el FIXER ya son familias distintas que se cruzan + el gate objetivo (`tsc`+E2E). Opus = corte suprema:
-solo los casos difíciles. Todos **remotos → cero contención** con el 9B (mata el wedge de memoria de la 1ª
-noche). Cuotas separadas → aprovechan Gemini/Codex ociosos casi sin tocar Claude.
+- **Desacople productor-consumidor:** el escáner local corre a FULL sin esperar a los chiquitos (cola
+  `suspectq` de por medio) → el local nunca queda ocioso; los chiquitos consumen a su ritmo.
+- **Fallback por cuota:** si un proveedor se agota/rate-limita, va a CUARENTENA (30 min) y la cadena usa
+  el siguiente (Codex dura menos → cae a Gemini → Claude → local). **Claude = fallback fiable.**
+- **Por qué funciona (datos reales):** familias distintas → errores no correlacionados → su acuerdo es
+  señal (validado 2/2 falso-vs-real; el 9B solo no distinguía). El filtro escéptico del chiquito bajó las
+  confirmaciones del **43% → ~5%** (sin inundar a los jueces caros). Todo remoto → cero contención de
+  memoria con el 9B local. Cuotas separadas → aprovecha Gemini/Codex casi sin tocar Claude.
 
 ## Arquitectura (pipeline productor–consumidor)
 
@@ -125,14 +128,18 @@ LOOP_WT=/tmp/wt LOOP_SUBDIR=apps/dashboard LOOP_DYNAMIC_ID=<un-id-real-de-tu-db-
 | Var | Default | Qué |
 |---|---|---|
 | `LOOP_BASE` | `http://host.docker.internal:11434` | endpoint de Ollama |
-| `LOOP_HUNTER` | `qwen3.5:9b` | modelo cazador (rápido) |
-| `LOOP_HUNTERS` | `6` | hilos cazadores (el 9B caza a full; los fuertes filtran) |
-| **`LOOP_JUDGES`** | `gemini:gemini-3-pro-preview` | **triage** REAL vs NOT_A_BUG (coma-separado = panel) |
-| `LOOP_JUDGE_MIN` | `1` | votos REAL para confirmar (2+ si pones panel) |
-| **`LOOP_FIXER`** | `codex` | **fixer** (familia distinta al juez) |
-| `LOOP_REVIEWER` | `gemini:gemini-3-pro-preview` | revisor de fixes riesgosos |
-| **`LOOP_ARBITER`** | `claude:opus` | 🏆 árbitro final, SOLO en escaladas por duda |
-| `LOOP_RESOLVER` | `qwen3.5:9b` | (legado) local si usas `LOOP_FIXER=ollama:…` |
+| `LOOP_HUNTER` | `qwen3.5:9b` | **escáner LOCAL** (tier 0, HTTP rápido/gratis) |
+| `LOOP_SCANNERS` | `4` | hilos del escáner local (corre a FULL) |
+| `LOOP_CONSENSUS` | `3` | muestras de auto-consistencia del escáner (1 si el cazador es fiable) |
+| **`LOOP_CHIQUITOS`** | `claude:haiku,gemini:gemini-2.5-flash` | **filtro/caza** (tier 1): filtran las sospechosas |
+| `LOOP_CHIQUITO_HILOS` | `2` | hilos chiquitos (consumen `suspectq`) |
+| `LOOP_SUSPECT_MAX` | `50` | runway del local (cola de sospechosas) |
+| **`LOOP_JUDGES`** | `gemini-3-pro, codex, sonnet, 30b-local` | **jueces fuertes** (tier 2); orden = escalera barato→caro |
+| `LOOP_JUDGE_MIN` | `2` | votos REAL para confirmar |
+| **`LOOP_FIXER`** | `codex, gemini-3-pro, sonnet, 30b-local` | **cadena fixer** (tier 3) con fallback |
+| `LOOP_REVIEWER` | `gemini-3-pro, sonnet` | revisor de fixes riesgosos (cadena) |
+| **`LOOP_ARBITER`** | `opus, gemini-3-pro, sonnet` | 🏆 **árbitro** (tier 4), cadena con fallback |
+| `LOOP_QUOTA_COOLDOWN` | `1800` | cuarentena (s) de un proveedor agotado antes de reintentar |
 | `LOOP_TARGET` | `50` | rondas limpias para "endurecer" un módulo |
 | `LOOP_HOURS` | `8` | deadline duro |
 | `LOOP_DEV_URL` | `http://localhost:3011` | dev server para el crawl E2E |

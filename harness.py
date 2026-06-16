@@ -46,6 +46,11 @@ ARBITER_CHAIN  = [x.strip() for x in os.environ.get("LOOP_ARBITER", "claude:opus
 # Codex es la cuota MÁS escasa (cuenta ChatGPT: solo gpt-5.5, sin mini, ~quota/5h). El default xhigh quema
 # muchísimo por llamada; un veredicto REAL/NOT_A_BUG no lo necesita → effort bajo estira la cuota a más llamadas.
 CODEX_EFFORT = os.environ.get("LOOP_CODEX_EFFORT", "low")
+# AUDITOR PROFUNDO local: el 80B (qwen3-coder-next, ~calidad Sonnet) corre DECOUPLED, fuera del camino crítico.
+# Lento (~6 tok/s CPU) pero gratis y fuerte → aprovecha CPU ociosa + ahorra cuota. Pinneado residente (carga 60GB
+# una sola vez). "" para desactivar. Sus hallazgos van directo a bugq (panel de jueces fuertes los cruza).
+AUDITOR = os.environ.get("LOOP_AUDITOR", "qwen3-coder-next:cpu")
+AUDITOR_KEEPALIVE = os.environ.get("LOOP_AUDITOR_KEEPALIVE", "180m")
 WT        = os.environ.get("LOOP_WT", "/tmp/wt")            # git worktree aislado (rama desechable)
 SUBDIR    = os.environ.get("LOOP_SUBDIR", "")              # subdir del proyecto dentro del worktree (p.ej. "apps/dashboard"); "" = raíz
 ROOT      = os.path.join(WT, SUBDIR) if SUBDIR else WT     # cwd donde corren npm/tsc/node
@@ -126,13 +131,14 @@ def save_status():
           "modules": {m: {k: MEM[m][k] for k in ("clean","iter","fixed","hardened","rejected")} | {"confirmed": len(MEM[m]["confirmed"])} for m in MODULES}}
     json.dump(st, open(STATUS, "w"), ensure_ascii=False, indent=1)
 
-def call_model(model, prompt, system=None, npred=600, think=None, timeout=120):
+def call_model(model, prompt, system=None, npred=600, think=None, timeout=120, keep_alive=None):
     # UNA sola llamada, SIN reintento. Lección del post-mortem: reintentar tras un timeout ENCOLA
     # otra generación en Ollama y AGRAVA la contención/cola — fue lo que wedgeó la caja toda la
     # noche. Mejor fallar rápido y seguir (el hunter ya hace 3 muestras de consenso como redundancia).
     body = {"model": model, "stream": False, "options": {"temperature": 0.25, "num_predict": npred},
             "messages": ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]}
     if think is not None: body["think"] = think
+    if keep_alive is not None: body["keep_alive"] = keep_alive   # pinnea modelos pesados residentes (carga 1 sola vez)
     try:
         req = urllib.request.Request(BASE + "/api/chat", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -456,7 +462,7 @@ def watchdog_loop():
             ps = json.loads(urllib.request.urlopen(BASE + "/api/ps", timeout=10).read()).get("models", [])
             for m in ps:
                 nm = m.get("name", "")
-                if nm not in (HUNTER, RESOLVER) and m.get("size", 0) > 20e9:  # >20GB y no lo usamos
+                if nm not in (HUNTER, RESOLVER, AUDITOR) and m.get("size", 0) > 20e9:  # >20GB y no lo usamos (el 80B auditor SÍ se usa)
                     urllib.request.urlopen(urllib.request.Request(
                         BASE + "/api/generate", data=json.dumps({"model": nm, "keep_alive": 0, "prompt": ""}).encode(),
                         headers={"Content-Type": "application/json"}), timeout=20).read()
@@ -545,6 +551,48 @@ def resolver_loop():
         MEM[bug["module"]]["fixed"].append(bug.get("hip") or bug.get("route"))
         save_mem(); save_status()
 
+def auditor_loop():
+    """80B LOCAL (~Sonnet, lento ~6 tok/s) — AUDITOR PROFUNDO decoupled, FUERA del camino crítico.
+    Revisa ventanas una a una SIN bloquear al 9B rápido; hallazgos → bugq directo (los jueces fuertes los cruzan).
+    Pinneado residente (keep_alive) → la carga de 60GB se paga UNA sola vez al inicio."""
+    if not AUDITOR: return
+    try:  # pre-warm + pin (1ª vez tarda varios min por los 60GB; no bloquea al resto del harness)
+        call_model(AUDITOR, "ok", npred=1, think=False, timeout=600, keep_alive=AUDITOR_KEEPALIVE)
+        log(f"[A80] auditor profundo {AUDITOR} CARGADO y pinneado ({AUDITOR_KEEPALIVE})")
+    except Exception as e:
+        log(f"[A80] no pude precargar el 80B ({e}) — auditor inactivo"); return
+    ci = 0
+    while not STOP.is_set() and time.time() < DEADLINE:
+        ci += 1; mod = list(MODULES)[ci % len(MODULES)]
+        if bugq.qsize() >= QMAX: time.sleep(5); continue
+        path = random.choice([f for f in MODULES[mod]["files"] if os.path.exists(os.path.join(ROOT, f))] or [None])
+        if not path: continue
+        code, off = read_window(path)
+        if not code: continue
+        m = MEM[mod]
+        prompt = (f"AUDITORÍA PROFUNDA (revisor senior, nivel Sonnet). Archivo `{path}`, módulo «{mod}».\n"
+                  f"Hipótesis YA probadas (NO repitas): {'; '.join(m['tried'][-12:]) or '(ninguna)'}\n\n"
+                  f"Busca UN bug REAL y SERIO que un escáner rápido pasaría por alto: lógica sutil, seguridad "
+                  f"(tenant/RBAC), máquina de estados, dinero/redondeo, concurrencia/idempotencia. Sé RIGUROSO: "
+                  f"si el código YA lo maneja, NO inventes. Responde SOLO JSON "
+                  f"{{\"hay_bug\":true|false,\"hipotesis\":\"<≤12 palabras, solo si REAL>\"}}.\n\n{code}")
+        out = call_model(AUDITOR, prompt, system=HUNTER_SYS, npred=220, think=False, timeout=320, keep_alive=AUDITOR_KEEPALIVE)
+        ITER_TS[0] = time.time()
+        try:
+            j = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        except Exception:
+            continue
+        hip = (j.get("hipotesis") or "").strip()
+        if not j.get("hay_bug") or not hip: continue
+        key = hip.lower()[:60]
+        with mem_lock:
+            if key in m["queued_keys"] or any(key in t.lower() for t in m["tried"]): continue
+            m["tried"].append(hip); m["queued_keys"].append(key)
+        bugq.put({"module": mod, "type": "code", "path": path, "hip": hip, "linea": "",
+                  "why": "auditor 80B (profundo)", "risk": risk_of(hip + " " + path)})
+        log(f"[A80] {mod}: auditor profundo → {hip[:55]}  (cola={bugq.qsize()})")
+        save_mem()
+
 # ----- main -----
 def main():
     open(LOG, "a").write("\n" + "=" * 70 + f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} HARNESS NOCTURNO E2E · hunter={HUNTER} resolver={RESOLVER}\n" + "=" * 70 + "\n")
@@ -554,6 +602,7 @@ def main():
     threads.append(threading.Thread(target=e2e_loop, daemon=True))
     threads.append(threading.Thread(target=watchdog_loop, daemon=True))
     threads.append(threading.Thread(target=resolver_loop, daemon=True))
+    if AUDITOR: threads.append(threading.Thread(target=auditor_loop, daemon=True))   # 80B local ~Sonnet, auditor profundo decoupled
     for t in threads: t.start()
     # supervisor — DURACIÓN POR TIEMPO (LOOP_HOURS), NO por iteraciones/convergencia: corre la corrida COMPLETA
     # escaneando continuo y confirmando limpio. Cero-bugs = éxito (no para temprano "porque ya validó"). El 9B

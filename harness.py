@@ -67,6 +67,7 @@ import tiers
 
 WT          = Path(os.environ.get('LOOP_WT', '/tmp/demeter-loop'))
 SUBDIR      = os.environ.get('LOOP_SUBDIR', 'apps/dashboard')
+WT_SUBDIR   = WT / SUBDIR     # cwd canónico para CLIs agénticos y gates (e2e, tsc)
 DEV_URL     = os.environ.get('LOOP_DEV_URL', 'http://localhost:3011')
 STORAGE     = os.environ.get('LOOP_STORAGE_STATE', '')  # vacío = modo demo
 DYN_ID      = os.environ.get('LOOP_DYNAMIC_ID', '')     # id sembrado para [id]
@@ -120,6 +121,8 @@ class Suspect:
     line: int
     snippet: str
     why: str                            # por qué el hunter cree que es bug
+    severity: str = 'medium'            # low | medium | high | critical
+    repro: str = ''                     # cómo dispararlo (opcional)
     confidence: float = 0.0             # 0..1 (consenso del hunter)
     samples: int = 0                    # cuántas muestras de auto-consistencia
     first_seen: float = field(default_factory=time.time)
@@ -255,6 +258,105 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Salud de modelos (cuarentena por timeouts/fallos repetidos).
+# Independiente de la CUOTA (quota.py): un modelo puede tener cuota pero estar
+# "zombi" — responde timeout sistemático (p.ej. varios `*-free` de opencode o
+# gemini-*-flash-preview). Tras HEALTH_FAIL_THRESHOLD fallos seguidos entra en
+# cuarentena QUARANTINE_SECS; cualquier respuesta válida lo resetea. La cuarentena
+# expira sola → el modelo tiene otra oportunidad (auto-curación).
+# ---------------------------------------------------------------------------
+QUARANTINE_SECS       = int(os.environ.get('LOOP_QUARANTINE_SECS', '600'))
+HEALTH_FAIL_THRESHOLD = int(os.environ.get('LOOP_HEALTH_FAIL_THRESHOLD', '3'))
+
+# Semilla de cuarentena: modelos con deadrate≥0.5 medidos en vivo (spec §8.2).
+# Se siembran al arranque para no quemar 180s×3 antes de que el umbral los pille.
+# Recuperables (la cuarentena expira). Sobrescribible por env.
+INITIAL_QUARANTINE = tuple(
+    m.strip() for m in os.environ.get(
+        'LOOP_INITIAL_QUARANTINE',
+        'gemini:gemini-3-flash-preview,'
+        'gemini:gemini-2.5-flash-lite,'
+        'minimax/MiniMax-M2.7-highspeed,'
+        'opencode:mimo-v2.5-free'
+    ).split(',') if m.strip()
+)
+
+_HEALTH: dict[str, dict] = {}
+_HEALTH_LOCK = threading.Lock()
+
+
+def _mark_health(model_id: str, ok: bool) -> None:
+    """Registra el resultado de una llamada. Cuarentena tras N fallos seguidos."""
+    with _HEALTH_LOCK:
+        h = _HEALTH.setdefault(model_id, {'fails': 0, 'quarantined_until': 0.0,
+                                          'calls': 0, 'oks': 0})
+        h['calls'] += 1
+        if ok:
+            h['oks'] += 1
+            h['fails'] = 0
+            h['quarantined_until'] = 0.0
+        else:
+            h['fails'] += 1
+            if h['fails'] >= HEALTH_FAIL_THRESHOLD and h['quarantined_until'] <= time.time():
+                h['quarantined_until'] = time.time() + QUARANTINE_SECS
+                log(f'  [health] {model_id} → CUARENTENA {QUARANTINE_SECS}s '
+                    f'({h["fails"]} fallos seguidos)')
+
+
+def is_healthy(model_id: str) -> bool:
+    with _HEALTH_LOCK:
+        h = _HEALTH.get(model_id)
+        return not h or time.time() >= h.get('quarantined_until', 0.0)
+
+
+def quarantined_models() -> list[str]:
+    now = time.time()
+    with _HEALTH_LOCK:
+        return sorted(m for m, h in _HEALTH.items() if now < h.get('quarantined_until', 0.0))
+
+
+def seed_quarantine(ids=INITIAL_QUARANTINE) -> None:
+    """Mete la lista de modelos conocidos-zombi en cuarentena inicial (gratis)."""
+    if not ids:
+        return
+    with _HEALTH_LOCK:
+        for mid in ids:
+            h = _HEALTH.setdefault(mid, {'fails': 0, 'quarantined_until': 0.0,
+                                         'calls': 0, 'oks': 0})
+            h['fails'] = HEALTH_FAIL_THRESHOLD
+            h['quarantined_until'] = time.time() + QUARANTINE_SECS
+    log(f'  [health] cuarentena inicial sembrada: {list(ids)}')
+
+
+def health_probe_all(specs, timeout: int = 25, workers: int = 8) -> None:
+    """Probe de arranque OPCIONAL (LOOP_HEALTH_PROBE=1): una llamada corta a cada
+    modelo único. Los que no responden quedan en cuarentena de inmediato. Cuesta
+    un poco de cuota cloud, por eso es opt-in; la marca perezosa en `call_model`
+    cubre el caso por defecto."""
+    seen = {}
+    for s in specs:
+        seen.setdefault(s.id, s)
+
+    def _probe(spec):
+        try:
+            t = call_model(spec, '', 'Responde solo: OK', max_tokens=8, timeout=timeout)
+        except Exception:
+            t = None
+        if t and t.strip():
+            log(f'  [health] probe OK {spec.id}')
+        else:
+            with _HEALTH_LOCK:
+                h = _HEALTH.setdefault(spec.id, {'fails': 0, 'quarantined_until': 0.0,
+                                                 'calls': 0, 'oks': 0})
+                h['fails'] = max(h['fails'], HEALTH_FAIL_THRESHOLD)
+                h['quarantined_until'] = time.time() + QUARANTINE_SECS
+            log(f'  [health] probe FALLÓ {spec.id} → cuarentena')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_probe, seen.values()))
+
+
+# ---------------------------------------------------------------------------
 # Invocación de modelos: punto único. Decide QUÉ modelo usar según rol +
 # estado de cuota, y registra el uso en `quota.record`.
 # ---------------------------------------------------------------------------
@@ -269,6 +371,8 @@ def call_model(spec: tiers.ModelSpec, system: str, prompt: str, max_tokens: int 
     if not quota.is_model_ok(spec.id):
         log(f'  [quota] {spec.id} bloqueado por cuota')
         return None
+    if not is_healthy(spec.id):
+        return None  # zombi en cuarentena: no lo invocamos (atasca la cola)
 
     t0 = time.time()
     text: Optional[str] = None
@@ -301,40 +405,85 @@ def call_model(spec: tiers.ModelSpec, system: str, prompt: str, max_tokens: int 
     except Exception as e:
         log(f'  [call] {spec.id} error: {e}')
 
+    # Salud: respuesta NO vacía = vivo; timeout/error/vacío = fallo. Usamos
+    # presencia de texto (no longitud) para no penalizar respuestas válidas y
+    # cortas como "REAL"/"OK" del filtro/juez.
+    _mark_health(spec.id, ok=bool(text and text.strip()))
     quota.record(spec.id, in_tok, out_tok)
     elapsed = time.time() - t0
     log(f'  [call] {spec.id} {elapsed:.1f}s  in~{in_tok}  out~{out_tok}')
     return text
 
 
+def _cli_cwd() -> Optional[str]:
+    """cwd para los CLI cloud agénticos (opencode/claude/gemini/codex).
+
+    Estos CLIs tienen herramientas de lectura de archivos que resuelven paths
+    RELATIVOS a su cwd. Si corren desde el dir del harness, un prompt que menciona
+    `app/(panel)/clientes/page.tsx` provoca `File not found` (el archivo vive en el
+    worktree). Devolvemos el worktree real si existe; si no, None (hereda el del
+    harness, comportamiento previo).
+    """
+    return str(WT_SUBDIR) if WT_SUBDIR.is_dir() else None
+
+
+# Semáforos por modelo Ollama: limitan la concurrencia contra una misma GPU para
+# evitar contención (el 30B daba `timed out` con 4 hilos pegándole a la vez). CPU=1
+# (80B serializado), GPU=2 (configurable con LOOP_OLLAMA_GPU_CONC).
+_OLLAMA_SEMAPHORES: dict[str, threading.Semaphore] = {}
+_OLLAMA_SEM_GUARD = threading.Lock()
+
+
+def _is_cpu_model(model_name: str) -> bool:
+    n = model_name.lower()
+    return 'cpu' in n or '80b' in n or 'next' in n
+
+
+def _ollama_sem(model_name: str) -> threading.Semaphore:
+    with _OLLAMA_SEM_GUARD:
+        sem = _OLLAMA_SEMAPHORES.get(model_name)
+        if sem is None:
+            limit = 1 if _is_cpu_model(model_name) else int(
+                os.environ.get('LOOP_OLLAMA_GPU_CONC', '2'))
+            sem = threading.Semaphore(limit)
+            _OLLAMA_SEMAPHORES[model_name] = sem
+        return sem
+
+
 def _call_ollama(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                  timeout: int) -> str:
     model_name = spec.id.split(':', 1)[1]
-    base = os.environ.get('LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+    # Node-aware (Fase B/C): si el spec trae base_url/num_ctx/gpu_index (poblados
+    # por el fleet), se usan; si no, defaults de entorno (comportamiento actual).
+    base = getattr(spec, 'base_url', None) or os.environ.get(
+        'LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+    num_ctx = getattr(spec, 'num_ctx', None) or int(
+        os.environ.get('LOOP_OLLAMA_NUM_CTX', '8192'))
+    options = {'num_predict': max_tokens, 'temperature': 0.2, 'num_ctx': num_ctx}
+    gpu_index = getattr(spec, 'gpu_index', None)
+    if gpu_index is not None:
+        # Hint best-effort; el pin fiable por GPU = instancia Ollama por GPU (Fase C).
+        options['main_gpu'] = gpu_index
     payload = {
         'model': model_name,
         'prompt': prompt,
         'system': system,
         'stream': False,
         # `keep_alive: '10m'` evita que Ollama descargue el modelo entre requests.
-        # Crítico para cadencia alta: la primera carga tarda 2-3s; las siguientes <1s.
         'keep_alive': os.environ.get('LOOP_OLLAMA_KEEP_ALIVE', '10m'),
-        'options': {'num_predict': max_tokens, 'temperature': 0.2},
+        'options': options,
     }
-    # El 80B CPU puede tardar 60-180s en responder requests grandes; el 30B
-    # GPU <10s. Timeout por modelo: modelos CPU reciben timeout más alto.
-    is_cpu = 'cpu' in model_name.lower() or '80b' in model_name.lower() or 'next' in model_name.lower()
-    actual_timeout = timeout
-    if is_cpu:
-        # CPU es ~10-20x más lento que GPU. Estiramos el timeout.
-        actual_timeout = max(timeout, 300)  # mínimo 5min para CPU
+    # CPU (80B) ~10-20x más lento que GPU → piso de 300s.
+    actual_timeout = max(timeout, 300) if _is_cpu_model(model_name) else timeout
     req = urllib.request.Request(
         f'{base}/api/generate',
         data=json.dumps(payload).encode(),
         headers={'Content-Type': 'application/json'},
     )
-    with urllib.request.urlopen(req, timeout=actual_timeout) as r:
-        data = json.loads(r.read())
+    # Semáforo por modelo: evita que N hilos saturen la misma GPU (causa de timeouts).
+    with _ollama_sem(model_name):
+        with urllib.request.urlopen(req, timeout=actual_timeout) as r:
+            data = json.loads(r.read())
     return data.get('response', '').strip()
 
 
@@ -353,6 +502,7 @@ def _call_minimax(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: i
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
         )
         out = result.stdout.strip()
         if not out and result.stderr:
@@ -411,6 +561,7 @@ def _call_opencode(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: 
             capture_output=True,
             text=True,
             timeout=actual_timeout,
+            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
         )
         out = result.stdout.strip()
         if not out and result.stderr:
@@ -442,6 +593,7 @@ def _call_claude_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
         )
         return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -466,6 +618,7 @@ def _call_gemini_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
         )
         if result.returncode != 0 and '429' in (result.stderr or ''):
             # Rate limit conocido: marcar para cuarentena.
@@ -492,6 +645,7 @@ def _call_codex_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens:
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
         )
         return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -522,78 +676,77 @@ SÍ reporta (con archivo:línea:snippet:razonamiento):
   · Fallos de transacciones DB (sin rollback, sin atomicidad).
   · Stocks/cartera/dinero que se pueden corromper.
 
-FORMATO DE SALIDA (estricto, una línea por bug):
-FILE::LINE::SNIPPET::REASON
+FORMATO DE SALIDA: una línea JSON por bug (JSONL), nada más antes ni después.
+{"file":"lib/queries/clientes.ts","line":42,"severity":"high","snippet":"const x = await db.query(...)","why":"falta filtro tenantId","repro":"abrir /clientes con otro tenant"}
 
 Donde:
-  - FILE: ruta relativa al repo (ej. lib/queries/clientes.ts)
-  - LINE: número de línea aproximado
-  - SNIPPET: 5-10 palabras del código sospechoso
-  - REASON: 1-2 frases explicando por qué es bug
+  - file: ruta relativa al subdir del repo
+  - line: entero (número de línea aproximado)
+  - severity: low | medium | high | critical
+  - snippet: el CÓDIGO sospechoso LITERAL (NO tu explicación)
+  - why: 1-2 frases explicando por qué es bug
+  - repro: cómo dispararlo (opcional)
 
-Si NO encuentras bugs en la zona, responde EXACTAMENTE: NO_BUGS
+Una línea JSON por bug. Si NO encuentras bugs en la zona, responde EXACTAMENTE: NO_BUGS
 """
 
 
 def _parse_bug_line(line: str) -> Optional[dict]:
-    """Extrae {file, line, snippet, why} de una línea de output del hunter.
-    Acepta varios formatos porque los modelos locales no siempre son estrictos.
-    Acepta paréntesis (rutas del App Router como `app/(panel)/...`).
+    """Extrae {file, line, severity, snippet, why, repro} de una línea del hunter.
+
+    Contrato nuevo (v7): una línea JSON por bug. Fallback robusto al formato viejo
+    `path:line <sep> texto`, des-duplicando el caso histórico en que snippet y why
+    quedaban idénticos (con `::` literales). Garantiza snippet (código) ≠ why (prosa)
+    cuando hay información para separarlos.
     """
-    # Patrón para el path: word chars, /, ., -, (, ).
-    PATH = r'[\w/.\-()]+'
-    # Formato 1: FILE::LINE::SNIPPET::REASON (estricto, el original).
+    line = line.strip()
+    if not line or line.startswith('#') or line.startswith('NO_BUGS'):
+        return None
+
+    # --- Contrato nuevo: JSON por bug ---
+    if line.startswith('{') and line.endswith('}'):
+        try:
+            d = json.loads(line)
+            f = str(d.get('file', '')).strip()
+            if f and ('line' in d):
+                return {
+                    'file': f,
+                    'line': int(d.get('line', 0) or 0),
+                    'severity': str(d.get('severity', 'medium')).lower(),
+                    'snippet': str(d.get('snippet', ''))[:200],
+                    'why': str(d.get('why', ''))[:500],
+                    'repro': str(d.get('repro', ''))[:300],
+                }
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass  # cae al fallback de línea
+
+    # --- Fallback: `path/file.ext:LINE <sep> resto` (formatos viejos 1-4) ---
+    PATH = r'[\w/.\-()]+\.[a-z]{1,5}'
     m = re.match(
-        rf'^{PATH}\.([a-z]{{1,5}})::(\d+)::([^:]{{1,200}})::(.*)$',
+        rf'^[\s\-\*`]*(?P<file>{PATH}):(?P<line>\d+)`?'
+        r'\s*[:\-–—]*\s*(?P<rest>.{5,800})$',
         line,
     )
-    if m:
-        return {
-            'file': m.group(0).split('::')[0],
-            'line': int(m.group(2)),
-            'snippet': m.group(3).strip()[:200],
-            'why': m.group(4).strip()[:500],
-        }
-    # Formato 2: FILE:LINE - REASON (con guión).
-    m = re.match(
-        rf'^{PATH}\.([a-z]{{1,5}}):(\d+)\s*[-–—]\s*(.{{5,500}})$',
-        line,
-    )
-    if m:
-        text = m.group(3).strip()
-        return {
-            'file': m.group(0).split(':')[0].rstrip(),
-            'line': int(m.group(2)),
-            'snippet': text[:200],
-            'why': text[:500],
-        }
-    # Formato 3: - FILE:LINE: ... (markdown bullet, como a veces devuelve el 30b).
-    m = re.match(
-        rf'^[\s\-\*]*({PATH}\.[a-z]{{1,5}}):(\d+)[:\s]+(.{{5,500}})$',
-        line,
-    )
-    if m:
-        text = m.group(3).strip()
-        return {
-            'file': m.group(1),
-            'line': int(m.group(2)),
-            'snippet': text[:200],
-            'why': text[:500],
-        }
-    # Formato 4: `path/file.tsx:42` seguido de texto (sin separador).
-    m = re.match(
-        rf'^`?({PATH}\.[a-z]{{1,5}}):(\d+)`?\s*[:\s\-–]?\s*(.{{5,500}})$',
-        line,
-    )
-    if m:
-        text = m.group(3).strip()
-        return {
-            'file': m.group(1),
-            'line': int(m.group(2)),
-            'snippet': text[:200],
-            'why': text[:500],
-        }
-    return None
+    if not m:
+        return None
+    rest = m.group('rest').strip().strip('`')
+    if '::' in rest:
+        # Formato histórico FILE::LINE::SNIPPET::REASON re-serializado: des-duplica.
+        parts = [p.strip() for p in rest.split('::') if p.strip()]
+        snippet = parts[0][:200] if parts else ''
+        why = (parts[-1] if len(parts) > 1 else parts[0])[:500] if parts else ''
+    else:
+        # Sin separador código/prosa: usamos el texto como why; snippet queda vacío
+        # (mejor vacío que duplicar la prosa como si fuera código).
+        snippet, why = '', rest[:500]
+    return {
+        'file': m.group('file'),
+        'line': int(m.group('line')),
+        'severity': 'medium',
+        'snippet': snippet,
+        'why': why,
+        'repro': '',
+    }
 
 
 def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
@@ -653,8 +806,9 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                     f'Pistas del orquestador para el archivo `{file}`:\n'
                     f'{context_block}\n\n'
                     f'```typescript\n{code[:8000]}\n```\n'
-                    'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
-                    'descripción. Si no hay bugs: NO_BUGS.\n'
+                    'Reporta CADA bug como UNA línea JSON (formato del sistema): '
+                    '{"file":...,"line":...,"severity":...,"snippet":"<código literal>","why":"<razón>"}. '
+                    'Si no hay bugs: NO_BUGS.\n'
                     'Céntrate SOLO en las pistas del orquestador.'
                 )
             else:
@@ -662,8 +816,9 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                 prompt = (
                     f'Audita el archivo `{file}` (longitud {len(code)} chars).\n'
                     f'```typescript\n{code[:8000]}\n```\n'
-                    'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
-                    'descripción. Si no hay bugs: NO_BUGS.\n'
+                    'Reporta CADA bug como UNA línea JSON (formato del sistema): '
+                    '{"file":...,"line":...,"severity":...,"snippet":"<código literal>","why":"<razón>"}. '
+                    'Si no hay bugs: NO_BUGS.\n'
                 )
             update_thread_state(f'hunter-{wid}', current_task=f'round {round_n+1}/{CONSENSUS_N}')
             text = call_model(hunter_spec, HUNTER_SYSTEM, prompt, max_tokens=1500)
@@ -681,6 +836,8 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                             line=m['line'],
                             snippet=m['snippet'],
                             why=m['why'],
+                            severity=m.get('severity', 'medium'),
+                            repro=m.get('repro', ''),
                             samples=1,
                             source=source_kind,
                         )
@@ -701,6 +858,16 @@ def yield_suspect(s: Suspect) -> None:
         Los modelos cloud son más precisos; saltan el filtro escéptico que
         siempre dice NOT_A_BUG y bloquea bugs reales.
     """
+    # Anti-fantasmas: descartar suspects cuyo archivo no existe en el worktree.
+    # El parser viejo producía paths basura (`fecha`, snippets como path) que
+    # llegaban hasta el fixer y gastaban jueces antes de abortar. Los hallazgos
+    # E2E usan una URL de ruta (no un path de fichero), así que se exceptúan.
+    s.file = (s.file or '').strip().lstrip('`').lstrip('./')
+    if s.source != 'e2e':
+        if not s.file or not (WT_SUBDIR / s.file).is_file():
+            log(f'  [yield] descartado fantasma {s.file!r}:{s.line}')
+            return
+
     if MEM.should_skip(s.file, s.line, s.snippet):
         STATS['suspects_filtered_as_known_fp'] += 1
         return
@@ -944,11 +1111,24 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
         if bug.votes_real >= JUDGE_MIN and bug.votes_real > bug.votes_not_bug:
             STATS['bugs_confirmed'] += 1
             log(f'  [judge-{wid}] CONFIRMED {bug.suspect.file}:{bug.suspect.line} '
-                f'({bug.votes_real}/{len(bug.voters)} REAL)')
-            # Lanzar fix en hilo aparte.
-            threading.Thread(
-                target=fixer_worker, args=(bug,), daemon=True, name=f'fixer-{wid}'
-            ).start()
+                f'({bug.votes_real}/{len(bug.voters)} REAL, sev={bug.suspect.severity})')
+            # Compuerta de auto-fix agresivo: solo auto-arreglamos SIN revisión humana
+            # si el bug es de severidad alta O hubo unanimidad de los jueces que votaron.
+            # Lo confirmado-pero-dudoso (medium con voto dividido) va a revisión, no a
+            # auto-commit ciego. Sobre-escribible con LOOP_AUTOFIX_ALL=1.
+            unanimous = (bug.votes_not_bug == 0 and bug.votes_real == len(bug.voters)
+                         and bug.votes_real >= JUDGE_MIN)
+            high_sev = bug.suspect.severity in ('high', 'critical')
+            if os.environ.get('LOOP_AUTOFIX_ALL', '0') == '1' or high_sev or unanimous:
+                threading.Thread(
+                    target=fixer_worker, args=(bug,), daemon=True, name=f'fixer-{wid}'
+                ).start()
+            else:
+                STATS['fixes_to_review'] += 1
+                _add_to_review(bug.suspect, '', 'judge-confirmed-no-autofix')
+                log(f'  [judge-{wid}] {bug.suspect.file}:{bug.suspect.line} confirmado '
+                    f'(sev={bug.suspect.severity}, {bug.votes_real}R/{bug.votes_not_bug}N) '
+                    f'→ revisión humana, no auto-fix')
         else:
             # No llegó a quorum → falso positivo probable.
             MEM.record_false_positive(bug.suspect.file, bug.suspect.line,
@@ -966,101 +1146,163 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
 # Aplica el fix, valida con tsc+E2E, commitea o revierte.
 # ---------------------------------------------------------------------------
 
+# Locks por archivo: evitan que 2+ fixers concurrentes editen el mismo archivo
+# (leerían el mismo `original` y se pisarían el commit/corromperían el código).
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(file: str) -> threading.Lock:
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(file, threading.Lock())
+
+
 def fixer_worker(bug: Bug) -> None:
-    log(f'  [fixer] {bug.suspect.file}:{bug.suspect.line} arrancando')
-    STATS['fixes_attempted'] += 1
-    update_thread_state(f'fixer-{bug.suspect.file}', kind='fixer',
-                        model='?', status='busy',
-                        current_file=bug.suspect.file, calls=1)
-
-    fixers = quota.filter_tier(tiers.get_tier3_fixers(), 'fixer')
-    if not fixers:
-        log('  [fixer] no hay fixers disponibles (todos en cuarentena)')
-        update_thread_state(f'fixer-{bug.suspect.file}', status='done', current_task='sin fixers')
+    # Dedup: si el bug ya fue arreglado, no repetir.
+    existing = MEM.get_bug(bug.suspect.file, bug.suspect.line, bug.suspect.snippet)
+    if existing and getattr(existing, 'fixed', False):
+        log(f'  [fixer] ya arreglado, skip {bug.suspect.file}:{bug.suspect.line}')
         return
-
-    # Leer el código actual.
-    path = WT / SUBDIR / bug.suspect.file
-    if not path.exists():
-        log(f'  [fixer] archivo no existe: {path}')
+    # Lock por archivo: un solo fixer a la vez por archivo (evita carrera).
+    lock = _file_lock(bug.suspect.file)
+    if not lock.acquire(blocking=False):
+        log(f'  [fixer] {bug.suspect.file} en proceso por otro fixer, skip')
         return
-    original = path.read_text(errors='ignore')
+    try:
+        log(f'  [fixer] {bug.suspect.file}:{bug.suspect.line} arrancando')
+        STATS['fixes_attempted'] += 1
+        update_thread_state(f'fixer-{bug.suspect.file}', kind='fixer',
+                            model='?', status='busy',
+                            current_file=bug.suspect.file, calls=1)
 
-    for spec in fixers:
-        prompt = (
-            f'Bug confirmado: {bug.suspect.file}:{bug.suspect.line}\n'
-            f'Snippet: {bug.suspect.snippet}\n'
-            f'Razón: {bug.suspect.why}\n\n'
-            f'Código actual (longitud {len(original)}):\n```typescript\n{original[:12000]}\n```\n'
-            'Aplica el fix MÍNIMO necesario. Devuelve el archivo COMPLETO '
-            'corregido, sin explicaciones. Si el fix requiere más de 200 líneas, '
-            'describe solo el cambio y devuélvelo en un patch.'
-        )
-        fixed = call_model(
-            spec,
-            'Eres un fixer de código. Devuelve solo el código arreglado, sin markdown.',
-            prompt, max_tokens=8000, timeout=180,
-        )
-        if not fixed or fixed.strip() == original.strip():
-            log(f'  [fixer] {spec.id} no produjo cambio')
-            continue
-
-        # Quitar markdown si lo agregó.
-        cleaned = re.sub(r'^```(?:typescript|ts|js)?\n', '', fixed)
-        cleaned = re.sub(r'\n```$', '', cleaned)
-        if not cleaned.strip() or cleaned.strip() == original.strip():
-            continue
-
-        # Aplicar y validar.
-        if _apply_and_validate(path, cleaned, bug.suspect):
-            STATS['fixes_succeeded'] += 1
-            commit = _commit_fix(path, bug.suspect)
-            if commit:
-                MEM.record_bug(bug.suspect.file, bug.suspect.line,
-                               bug.suspect.snippet, fix_commit=commit)
-                if _is_risky(bug.suspect):
-                    STATS['fixes_to_review'] += 1
-                    _add_to_review(bug.suspect, commit, spec.id)
-                log(f'  [fixer] OK {bug.suspect.file}:{bug.suspect.line} '
-                    f'({spec.id} → {commit[:7]})')
-            else:
-                # Aplicado pero no comiteado (validó pero git falló).
-                log(f'  [fixer] aplicado pero sin commit: {path}')
-            update_thread_state(f'fixer-{bug.suspect.file}', status='done',
-                                current_task='OK')
+        fixers = quota.filter_tier(tiers.get_tier3_fixers(), 'fixer')
+        if not fixers:
+            log('  [fixer] no hay fixers disponibles (todos en cuarentena)')
+            update_thread_state(f'fixer-{bug.suspect.file}', status='done', current_task='sin fixers')
             return
-        else:
-            # Validación falló: revertir y probar siguiente fixer.
-            path.write_text(original)
-            log(f'  [fixer] {spec.id} falló la validación, revertido')
 
-    log(f'  [fixer] TODOS los fixers fallaron para {bug.suspect.file}:{bug.suspect.line}')
-    update_thread_state(f'fixer-{bug.suspect.file}', status='done',
-                        current_task='todos fallaron')
+        # Leer el código actual.
+        path = WT / SUBDIR / bug.suspect.file
+        if not path.exists():
+            log(f'  [fixer] archivo no existe: {path}')
+            return
+        original = path.read_text(errors='ignore')
+
+        for spec in fixers:
+            prompt = (
+                f'Bug confirmado: {bug.suspect.file}:{bug.suspect.line}\n'
+                f'Snippet: {bug.suspect.snippet}\n'
+                f'Razón: {bug.suspect.why}\n\n'
+                f'Código actual (longitud {len(original)}):\n```typescript\n{original[:12000]}\n```\n'
+                'Aplica el fix MÍNIMO necesario. Devuelve el archivo COMPLETO '
+                'corregido, sin explicaciones. Si el fix requiere más de 200 líneas, '
+                'describe solo el cambio y devuélvelo en un patch (diff unificado).'
+            )
+            # El fixer LOCAL (30B GPU) necesita timeout amplio (fix real ~123s)
+            # y menos tokens para no excederse; el cloud usa los defaults.
+            is_local = spec.id.startswith('ollama:')
+            fix_timeout = 360 if is_local else 180
+            fix_maxtok = 2500 if is_local else 8000
+            fixed = call_model(
+                spec,
+                'Eres un fixer de código. Devuelve solo el código arreglado, sin markdown.',
+                prompt, max_tokens=fix_maxtok, timeout=fix_timeout,
+            )
+            if not fixed or fixed.strip() == original.strip():
+                log(f'  [fixer] {spec.id} no produjo cambio')
+                continue
+
+            # Quitar markdown si lo agregó.
+            cleaned = re.sub(r'^```(?:typescript|ts|js)?\n', '', fixed)
+            cleaned = re.sub(r'\n```$', '', cleaned)
+            if not cleaned.strip() or cleaned.strip() == original.strip():
+                continue
+
+            # Aplicar y validar.
+            if _apply_and_validate(path, cleaned, bug.suspect):
+                STATS['fixes_succeeded'] += 1
+                commit = _commit_fix(path, bug.suspect)
+                if commit:
+                    MEM.record_bug(bug.suspect.file, bug.suspect.line,
+                                   bug.suspect.snippet, fix_commit=commit)
+                    if _is_risky(bug.suspect):
+                        STATS['fixes_to_review'] += 1
+                        _add_to_review(bug.suspect, commit, spec.id)
+                    log(f'  [fixer] OK {bug.suspect.file}:{bug.suspect.line} '
+                        f'({spec.id} → {commit[:7]})')
+                else:
+                    # Aplicado pero no comiteado (validó pero git falló).
+                    log(f'  [fixer] aplicado pero sin commit: {path}')
+                update_thread_state(f'fixer-{bug.suspect.file}', status='done',
+                                    current_task='OK')
+                return
+            else:
+                # Validación falló: revertir y probar siguiente fixer.
+                path.write_text(original)
+                log(f'  [fixer] {spec.id} falló la validación, revertido')
+
+        log(f'  [fixer] TODOS los fixers fallaron para {bug.suspect.file}:{bug.suspect.line}')
+        update_thread_state(f'fixer-{bug.suspect.file}', status='done',
+                            current_task='todos fallaron')
+    finally:
+        lock.release()
+
+
+def _looks_like_patch(text: str) -> bool:
+    t = text.lstrip()
+    return t.startswith(('--- ', 'diff ', '@@ ')) or '\n@@ ' in text
+
+
+def _patch_files(diff_text: str) -> set:
+    files = set()
+    for ln in diff_text.splitlines():
+        if ln.startswith(('+++ ', '--- ')):
+            p = ln[4:].strip()
+            if p and p != '/dev/null':
+                files.add(re.sub(r'^[ab]/', '', p))
+    return files
+
+
+def _apply_patch(diff_text: str) -> bool:
+    try:
+        r = subprocess.run(['git', 'apply', '--3way', '--whitespace=nowarn', '-'],
+                           input=diff_text, cwd=str(WT), capture_output=True,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            log(f'  [fix] git apply falló: {(r.stderr or "")[:160]}')
+        return r.returncode == 0
+    except Exception as e:
+        log(f'  [fix] git apply excepción: {e}')
+        return False
 
 
 def _apply_and_validate(path: Path, new_content: str, suspect: Suspect) -> bool:
-    """Aplica el cambio, corre tsc + un sub-set de e2e, revierte si falla."""
-    original = path.read_text(errors='ignore')
-    try:
-        path.write_text(new_content)
-        # Gate 1: typecheck.
-        if not _run_tsc():
-            log('  [fix] tsc falló')
+    """Aplica el cambio (archivo completo o patch unificado), corre tsc + E2E
+    DIRIGIDO a la ruta del bug; revierte si falla. El caller (fixer_worker)
+    restaura `path` si devolvemos False, así que aquí solo rechazamos patches
+    multi-archivo (no restaurables por el caller)."""
+    if _looks_like_patch(new_content):
+        touched = _patch_files(new_content)
+        if len(touched) > 1:
+            log(f'  [fix] patch multi-archivo rechazado: {sorted(touched)}')
             return False
-        # Gate 2: smoke E2E (no el suite completo, solo las rutas afectadas).
-        if not _run_smoke_subset(suspect.file):
-            log('  [fix] E2E smoke falló')
+        if not _apply_patch(new_content):
             return False
-        return True
-    except Exception as e:
-        log(f'  [fix] excepción: {e}')
-        path.write_text(original)
+    else:
+        try:
+            path.write_text(new_content)
+        except OSError as e:
+            log(f'  [fix] no se pudo escribir: {e}')
+            return False
+    # Gate 1: typecheck (cubre lib/ no-ruteable y errores de tipo).
+    if not _run_tsc():
+        log('  [fix] tsc falló')
         return False
-    finally:
-        # Si falló, reasegurar el original.
-        if path.read_text(errors='ignore') != new_content:
-            pass  # ya revertido arriba
+    # Gate 2: E2E DIRIGIDO a la ruta afectada (no solo la home).
+    if not _run_smoke_subset(suspect.file):
+        log('  [fix] E2E gate falló')
+        return False
+    return True
 
 
 def _run_tsc() -> bool:
@@ -1077,17 +1319,82 @@ def _run_tsc() -> bool:
         return False
 
 
-def _run_smoke_subset(file_path: str) -> bool:
-    """E2E smoke rápido contra el dev server."""
+def _route_for_file(file_path: str) -> Optional[str]:
+    """Deriva la ruta URL del módulo afectado a partir del path del archivo."""
+    m = re.search(r'app/\(panel\)/([^/]+)/', file_path)
+    if m:
+        return '/' + m.group(1)
+    m = re.search(r'app/([^/(][^/]*)/', file_path)  # rutas fuera de (panel)
+    return '/' + m.group(1) if m else None
+
+
+def _dev_server_up() -> bool:
     try:
-        # Si la ruta toca un módulo del panel, smoke contra la home + 1 ruta del módulo.
-        url = DEV_URL + '/'
-        with urllib.request.urlopen(url, timeout=15) as r:
-            if r.status >= 500:
-                return False
-        return True
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        with urllib.request.urlopen(DEV_URL + '/', timeout=8) as r:
+            return r.status < 500
+    except Exception:
         return False
+
+
+def _run_e2e_route(route: str, max_actions: int = 12, budget_ms: int = 45000,
+                   timeout: int = 90) -> tuple:
+    """Corre el crawler E2E contra una ruta. Devuelve (corrió: bool, errores_fatales: list).
+
+    e2e-runner.js carga chromium de `process.cwd()/node_modules` → lo corremos con
+    cwd=WT_SUBDIR (donde vive playwright del repo objetivo), pasando el path absoluto
+    al runner. Contrato: escenario JSON por stdin → {route,ok,errors:[{kind,where,detail}]}.
+    """
+    scn = {'baseURL': DEV_URL, 'route': route, 'maxActions': max_actions, 'budgetMs': budget_ms}
+    if STORAGE:
+        scn['storageState'] = STORAGE
+    runner = str(Path(__file__).parent / 'e2e-runner.js')
+    env = dict(os.environ)
+    env.setdefault('DASHBOARD_NM', str(WT_SUBDIR / 'node_modules'))
+    try:
+        res = subprocess.run(['node', runner], input=json.dumps(scn),
+                             capture_output=True, text=True, timeout=timeout,
+                             cwd=str(WT_SUBDIR), env=env)
+        out = json.loads(res.stdout)
+    except Exception as e:
+        log(f'  [fix] E2E no corrió ({route}): {e}')
+        return (False, [])
+    if out.get('fatal'):
+        log(f'  [fix] E2E fatal ({route}): {str(out.get("fatal"))[:120]}')
+        return (False, [])
+    fatal = [er for er in out.get('errors', [])
+             if er.get('kind') in ('http', 'pageerror', 'errorUI')]
+    return (True, fatal)
+
+
+def _run_smoke_subset(file_path: str) -> bool:
+    """Gate de ejecución DIRIGIDO a la ruta del bug. `tsc` ya corrió antes.
+
+    Modo agresivo (default): si no hay dev server o el E2E no puede correr, cae a
+    tsc-only (que ya pasó) para no bloquear todos los fixes por infra ausente.
+    Modo estricto (LOOP_GATE_REQUIRE_E2E=1): bloquea el commit si el E2E no corre.
+    """
+    strict = os.environ.get('LOOP_GATE_REQUIRE_E2E', '0') == '1'
+    if not _dev_server_up():
+        if strict:
+            log('  [fix] gate estricto: dev server caído → NO commitear')
+            return False
+        log('  [fix] dev server caído → gate tsc-only')
+        return True
+    route = _route_for_file(file_path)
+    if not route:
+        return True  # lib/ no ruteable: tsc ya cubre
+    ran, fatal = _run_e2e_route(route)
+    if not ran:
+        if strict:
+            log(f'  [fix] E2E no corrió en {route} (estricto) → NO commitear')
+            return False
+        log(f'  [fix] E2E no corrió en {route} → tsc-only')
+        return True
+    if fatal:
+        log(f'  [fix] E2E {route}: {len(fatal)} fatales {[f.get("kind") for f in fatal]} → revertir')
+        return False
+    log(f'  [fix] E2E {route}: limpio ✓')
+    return True
 
 
 def _commit_fix(path: Path, suspect: Suspect) -> Optional[str]:
@@ -1146,37 +1453,59 @@ def _add_to_review(suspect: Suspect, commit: str, model: str) -> None:
 # ---------------------------------------------------------------------------
 
 def e2e_sweep_worker(zone: str) -> None:
-    """Corre el crawler E2E contra una zona y emite suspectq con hallazgos."""
+    """Corre el crawler E2E contra una zona y emite suspectq con hallazgos.
+
+    Usa el contrato REAL de e2e-runner.js: escenario JSON por stdin
+    ({baseURL,route,storageState?,maxActions?,budgetMs?}) → objeto JSON
+    {route,ok,errors:[{kind,where,detail}]}. (El código viejo pasaba flags
+    `--zone`/`--dev-url` que el runner NO acepta → 0 hallazgos siempre.)
+    """
     if not STORAGE and not DYN_ID:
         return  # modo demo, ya cubierto por el smoke global
-    log(f'  [e2e-sweep] zona={zone} arrancando')
+    route = '/' + zone.replace('app/(panel)/', '').strip('/')
+    log(f'  [e2e-sweep] {route} arrancando')
+    scn = {
+        'baseURL': DEV_URL,
+        'route': route,
+        'maxActions': int(os.environ.get('LOOP_E2E_ACTIONS', '24')),
+        'budgetMs': int(os.environ.get('LOOP_E2E_BUDGET_MS', '70000')),
+    }
+    if STORAGE:
+        scn['storageState'] = STORAGE
+    runner = str(Path(__file__).parent / 'e2e-runner.js')
+    env = dict(os.environ)
+    env.setdefault('DASHBOARD_NM', str(WT_SUBDIR / 'node_modules'))
     try:
-        cmd = ['node', 'e2e-runner.js', '--zone', zone, '--dev-url', DEV_URL]
-        if STORAGE:
-            cmd += ['--storage-state', STORAGE]
-        if DYN_ID:
-            cmd += ['--dynamic-id', DYN_ID]
         result = subprocess.run(
-            cmd, cwd=str(Path(__file__).parent),
-            capture_output=True, text=True, timeout=600,
+            ['node', runner], input=json.dumps(scn),
+            cwd=str(WT_SUBDIR), env=env,
+            capture_output=True, text=True, timeout=180,
         )
-        # Parsear hallazgos del JSON de salida.
-        for line in result.stdout.splitlines():
-            try:
-                h = json.loads(line)
-                if h.get('type') in ('console_error', 'http_5xx', 'react_error', 'broken_link'):
-                    STATS['e2e_findings'] += 1
-                    yield_suspect(Suspect(
-                        file=h.get('route', 'unknown'),
-                        line=0,
-                        snippet=h.get('message', '')[:100],
-                        why=f'E2E: {h.get("type")} — {h.get("message", "")[:80]}',
-                        source='e2e',
-                    ))
-            except json.JSONDecodeError:
-                pass
+        out = json.loads(result.stdout)
     except subprocess.TimeoutExpired:
-        log(f'  [e2e-sweep] zona={zone} timeout')
+        log(f'  [e2e-sweep] {route} timeout')
+        return
+    except json.JSONDecodeError:
+        log(f'  [e2e-sweep] {route} salida no-JSON: {(result.stdout or "")[:160]}')
+        return
+    if out.get('fatal'):
+        log(f'  [e2e-sweep] {route} fatal: {str(out.get("fatal"))[:140]}')
+        return
+    errors = out.get('errors', [])
+    for err in errors:
+        STATS['e2e_findings'] += 1
+        kind = err.get('kind', '?')
+        where = err.get('where', route)
+        detail = str(err.get('detail', ''))
+        yield_suspect(Suspect(
+            file=out.get('route', route),
+            line=0,
+            snippet=detail[:100],
+            why=f'E2E {kind}@{where}: {detail[:120]}',
+            severity='high' if kind in ('http', 'pageerror', 'errorUI') else 'medium',
+            source='e2e',
+        ))
+    log(f'  [e2e-sweep] {route}: {len(errors)} hallazgos')
 
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1644,9 @@ def main() -> None:
     log(MEM.summary())
     log('')
 
+    # Cuarentena inicial de modelos zombi conocidos (gratis, inmediata).
+    seed_quarantine()
+
     # Cargar tiers filtrados por cuota.
     hunter_specs = quota.filter_tier(tiers.get_tier0_hunters(), 'tier0') or list(tiers.TIER0_HUNTERS)
     second_specs = quota.filter_tier(tiers.get_tier0_30b(), 'tier0') or list(tiers.TIER0_30B_OPINIONS)
@@ -1356,7 +1688,17 @@ def main() -> None:
     log(f'  Cloud hunter specs:    {[s.id for s in cloud_hunter_specs]}')
     log(f'  Filter specs activos:  {[s.id for s in filter_specs]}')
     log(f'  Judge specs activos:   {[s.id for s in judge_specs]}')
+    log(f'  Cuarentena inicial:    {quarantined_models()}')
     log('')
+
+    # Probe de salud ACTIVO opcional (LOOP_HEALTH_PROBE=1): pre-cuarentena los
+    # zombis desconocidos antes de que atasquen las colas. Off por defecto
+    # (cuesta algo de cuota; la marca perezosa en call_model cubre el resto).
+    if os.environ.get('LOOP_HEALTH_PROBE', '0') == '1':
+        log('  [health] probe activo de arranque...')
+        health_probe_all(list(hunter_specs) + list(cloud_hunter_specs)
+                         + list(filter_specs) + list(judge_specs))
+        log(f'  [health] tras probe, en cuarentena: {quarantined_models()}')
 
     # Discovery.
     code_zones = discover_code_zones()

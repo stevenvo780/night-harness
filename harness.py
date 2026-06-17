@@ -56,6 +56,7 @@ from typing import Optional
 
 # Módulos del v6.
 import memory
+import orchestrator
 import quota
 import tiers
 
@@ -546,9 +547,23 @@ def _parse_bug_line(line: str) -> Optional[dict]:
     return None
 
 
-def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int) -> None:
-    """Un hilo del escáner. Procesa una zona y emite suspectq."""
-    log(f'  [hunter-{wid}] {hunter_spec.id} arrancando ({len(zone_files)} archivos)')
+def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
+                 hunting_prompts: Optional[list] = None) -> None:
+    """Un hilo del escáner. Procesa una zona y emite suspectq.
+
+    Si `hunting_prompts` está presente (generado por el orquestador), cada
+    archivo recibe prompts DIRIGIDOS con conocimiento del dominio (estados,
+    auth, relaciones), no genéricos. Esto multiplica la tasa de bugs reales.
+    """
+    # Indexar prompts por archivo para lookup rápido.
+    prompts_by_file: dict[str, list] = {}
+    if hunting_prompts:
+        for p in hunting_prompts:
+            fname = p.file if hasattr(p, 'file') else p.get('file', '')
+            prompts_by_file.setdefault(fname, []).append(p)
+
+    log(f'  [hunter-{wid}] {hunter_spec.id} arrancando ({len(zone_files)} archivos'
+        f'{", orquestador activo" if hunting_prompts else ""})')
     for file in zone_files:
         path = WT / SUBDIR / file
         if not path.exists():
@@ -560,19 +575,40 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int)
         if not code.strip():
             continue
 
+        # Determinar si hay prompts de orquestador para este archivo.
+        targeted = prompts_by_file.get(file, []) if hunting_prompts else []
+
         # Consenso: 3 muestras; solo emitimos si la mayoría coincide.
         for round_n in range(CONSENSUS_N):
-            prompt = (
-                f'Audita el archivo `{file}` (longitud {len(code)} chars).\n'
-                f'```typescript\n{code[:8000]}\n```\n'
-                'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
-                'descripción, uno por línea. Si no hay bugs: NO_BUGS.\n'
-                'Ejemplo: `lib/queries/foo.ts:42` - validacion zod faltante'
-            )
+            if targeted:
+                # PROMPT DIRIGIDO: el orquestador nos dice QUÉ buscar en este archivo.
+                ctx_lines = []
+                for tp in targeted[:3]:  # máximo 3 prompts por archivo
+                    reason = tp.reason if hasattr(tp, 'reason') else tp.get('reason', '')
+                    more_ctx = tp.context if hasattr(tp, 'context') else tp.get('context', '')
+                    ctx_lines.append(f'  · {reason}')
+                    if more_ctx:
+                        ctx_lines.append(f'    Contexto: {more_ctx}')
+                context_block = '\n'.join(ctx_lines)
+                prompt = (
+                    f'Pistas del orquestador para el archivo `{file}`:\n'
+                    f'{context_block}\n\n'
+                    f'```typescript\n{code[:8000]}\n```\n'
+                    'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
+                    'descripción. Si no hay bugs: NO_BUGS.\n'
+                    'Céntrate SOLO en las pistas del orquestador.'
+                )
+            else:
+                # PROMPT GENÉRICO (fallback si el orquestador no conoce este archivo).
+                prompt = (
+                    f'Audita el archivo `{file}` (longitud {len(code)} chars).\n'
+                    f'```typescript\n{code[:8000]}\n```\n'
+                    'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
+                    'descripción. Si no hay bugs: NO_BUGS.\n'
+                )
             text = call_model(hunter_spec, HUNTER_SYSTEM, prompt, max_tokens=1500)
             if not text or 'NO_BUGS' in text:
                 continue
-            # Parsear con el parser flexible (4 formatos aceptados).
             for line in text.splitlines():
                 line = line.strip()
                 if not line or line.startswith('NO_BUGS') or line.startswith('#'):
@@ -1158,6 +1194,33 @@ def main() -> None:
         return
     log(f'  Zonas de código: {len(code_zones)} (suma {sum(len(z) for z in code_zones)} archivos)')
 
+    # Orquestador de prompts: genera prompts DIRIGIDOS con conocimiento del dominio.
+    # Usa un modelo de alto contexto (gemini-2.5-flash-lite, 1M ctx) para entender
+    # el proyecto y guiar a los hunters hacia bugs reales, no ruido.
+    log('')
+    log('  [main] Generando prompts de caza con orquestador...')
+    hunting_prompts = orchestrator.generate_hunting_prompts(
+        str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
+    )
+    if hunting_prompts:
+        log(f'  [main] Orquestador: {len(hunting_prompts)} prompts dirigidos generados')
+        # Log de muestra: primeros 3 prompts
+        for i, p in enumerate(hunting_prompts[:3]):
+            reason = p.reason if hasattr(p, 'reason') else p.get('reason', '?')
+            file = p.file if hasattr(p, 'file') else p.get('file', '?')
+            log(f'         [{i+1}] {file}: {reason[:100]}')
+        # Generar también journeys E2E si no se desactivaron.
+        if not args.no_e2e:
+            e2e_journeys = orchestrator.generate_e2e_journeys(
+                str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
+            )
+            if e2e_journeys:
+                log(f'  [main] Orquestador: {len(e2e_journeys)} journeys E2E generados')
+    else:
+        log('  [main] Orquestador no generó prompts (cache o fallback heurístico)')
+        hunting_prompts = None
+    log('')
+
     # Watchdog.
     threading.Thread(target=watchdog, daemon=True, name='watchdog').start()
 
@@ -1167,6 +1230,7 @@ def main() -> None:
         t = threading.Thread(
             target=hunter_worker,
             args=(code_zones[i % len(code_zones)], hunter_specs[i % len(hunter_specs)], i),
+            kwargs={'hunting_prompts': hunting_prompts},
             daemon=True,
             name=f'hunter-{i}',
         )
@@ -1178,6 +1242,7 @@ def main() -> None:
         t = threading.Thread(
             target=hunter_worker,
             args=(code_zones[(i + HUNTER_HILOS) % len(code_zones)], second_specs[i % len(second_specs)], i),
+            kwargs={'hunting_prompts': hunting_prompts},
             daemon=True,
             name=f'second-{i}',
         )

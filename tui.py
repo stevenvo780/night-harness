@@ -16,6 +16,8 @@ Teclas:
   p / P    pausar/reanudar auto-refresh
   c / C    limpiar el log mostrado
   l / L    cambiar layout (compact/full/metrics-only)
+  s / S    lanzar / detener ciclo del harness
+  d / D    cambiar duración del ciclo (1h/2h/4h/8h/indefinido)
   ?        ayuda
   ↑/↓      scroll en el panel de log
 
@@ -563,6 +565,84 @@ def main(stdscr):
 
     paused = False
     layout = 'full'  # 'full' | 'compact' | 'metrics'
+    cycle_duration = int(os.environ.get('LOOP_HOURS', '8'))  # horas del ciclo
+    cycle_launched = False  # true cuando lanzamos un ciclo desde la TUI
+
+    # --- helpers TUI ---
+    def _stop_harness():
+        """Mata el harness si está corriendo."""
+        if os.path.exists(HARNESS_PID_FILE):
+            try:
+                pid = int(open(HARNESS_PID_FILE).read().strip())
+                os.kill(pid, 15)  # SIGTERM
+                time.sleep(0.5)
+                if check_alive(pid):
+                    os.kill(pid, 9)  # SIGKILL
+                os.remove(HARNESS_PID_FILE)
+            except (OSError, ValueError):
+                pass
+
+    def _launch_harness(wt_dir: str = '/tmp/wt-night', subdir: str = 'apps/dashboard',
+                        hours: int = 8, dev_url: str = ''):
+        """Lanza el harness en background con nohup."""
+        env = os.environ.copy()
+        env['LOOP_WT'] = wt_dir
+        env['LOOP_SUBDIR'] = subdir
+        env['LOOP_HOURS'] = str(hours)
+        if dev_url:
+            env['LOOP_DEV_URL'] = dev_url
+        harness_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'harness.py')
+        cmd = ['nohup', 'python3', '-u', harness_py,
+               '--no-e2e',  # por ahora sin E2E (se puede cambiar)
+               ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=open(LOG_FILE, 'a'),  # append al log
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                preexec_fn=os.setpgrp,  # grupo propio para no heredar CTRL+C
+            )
+            with open(HARNESS_PID_FILE, 'w') as f:
+                f.write(str(proc.pid))
+            return proc.pid
+        except Exception as e:
+            return 0
+
+    def _show_duration_menu(stdscr, current: int) -> int:
+        """Muestra un menú de selección de duración."""
+        options = [(1, '1 hora'), (2, '2 horas'), (4, '4 horas'),
+                   (8, '8 horas'), (12, '12 horas'), (24, '24 horas'),
+                   (0, 'Indefinido (hasta CTRL+C)')]
+        sel = 0
+        for i, (hours, _) in enumerate(options):
+            if hours == current:
+                sel = i
+                break
+        while True:
+            h, w = stdscr.getmaxyx()
+            menu_h = len(options) + 3
+            menu_y = max(2, (h - menu_h) // 2)
+            menu_x = max(2, (w - 30) // 2)
+            stdscr.clear()
+            for i, (_, label) in enumerate(options):
+                prefix = '▸ ' if i == sel else '  '
+                color = (curses.color_pair(COLOR_PAIR_GREEN) | curses.A_BOLD
+                         if i == sel else curses.color_pair(COLOR_PAIR_DEFAULT))
+                stdscr.addstr(menu_y + i, menu_x, f'{prefix}{label}', color)
+            stdscr.addstr(menu_y + len(options), menu_x, 'ENTER: confirmar  ESC: cancelar',
+                          curses.color_pair(COLOR_PAIR_DEFAULT) | curses.A_DIM)
+            k = stdscr.getch()
+            if k == curses.KEY_UP:
+                sel = (sel - 1) % len(options)
+            elif k == curses.KEY_DOWN:
+                sel = (sel + 1) % len(options)
+            elif k in (ord('\n'), ord('\r'), curses.KEY_ENTER):
+                return options[sel][0]
+            elif k == 27:  # ESC
+                return current
+            time.sleep(0.01)
 
     while True:
         key = stdscr.getch()
@@ -589,6 +669,9 @@ def main(stdscr):
                 "  p / P     pausar / reanudar auto-refresh",
                 "  c / C     limpiar log mostrado",
                 "  l / L     cambiar layout (full / compact / metrics)",
+                "  s / S     lanzar / detener ciclo del harness",
+                "  d / D     cambiar duración del ciclo",
+                f"            → actual: {cycle_duration}h {'(indefinido)' if cycle_duration == 0 else ''}",
                 "  ↑ / ↓     scroll en el log",
                 "  ?         esta ayuda (cualquier tecla para volver)",
             ]
@@ -596,6 +679,35 @@ def main(stdscr):
                 stdscr.addstr(i, 1, hl, curses.color_pair(COLOR_PAIR_DEFAULT))
             stdscr.getch()
             stdscr.clear()
+        elif key in (ord('s'), ord('S')):
+            # Toggle: si está corriendo → parar; si no → lanzar.
+            if harness_pid and check_alive(harness_pid):
+                log.lines.append(f'[TUI] deteniendo harness (PID {harness_pid})...')
+                _stop_harness()
+                harness_pid = 0
+                cycle_launched = False
+                log.lines.append('[TUI] harness detenido.')
+            else:
+                log.lines.append(f'[TUI] lanzando ciclo del harness ({cycle_duration}h '
+                                 f'en /tmp/wt-night/apps/dashboard)...')
+                pid = _launch_harness(hours=cycle_duration)
+                if pid:
+                    harness_pid = pid
+                    cycle_launched = True
+                    log.lines.append(f'[TUI] harness lanzado con PID {pid}, duración {cycle_duration}h')
+                else:
+                    log.lines.append('[TUI] ERROR: no se pudo lanzar el harness.')
+            last_refresh = 0
+        elif key in (ord('d'), ord('D')):
+            # Menú de selección de duración.
+            curses.curs_set(1)
+            cycle_duration = _show_duration_menu(stdscr, cycle_duration)
+            curses.curs_set(0)
+            log.lines.append(f'[TUI] duración del ciclo: {cycle_duration}h '
+                             f'{"(indefinido)" if cycle_duration == 0 else ""}')
+            stdscr.clear()
+            last_refresh = 0
+
         # Refresh automático.
         if not paused and (time.time() - last_refresh) >= REFRESH_SEC:
             last_refresh = time.time()

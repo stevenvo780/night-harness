@@ -74,8 +74,13 @@ TARGET      = int(os.environ.get('LOOP_TARGET', '50'))   # rondas limpias para "
 # Concurrencia por tier.
 HUNTER_HILOS    = int(os.environ.get('LOOP_HUNTERS', '4'))     # hilos 9b
 SECOND_HILOS    = int(os.environ.get('LOOP_SECOND_HILOS', '2'))  # hilos 30b
-FILTER_HILOS    = int(os.environ.get('LOOP_FILTER_HILOS', '2'))  # tier 1
-JUDGE_HILOS     = int(os.environ.get('LOOP_JUDGE_HILOS', '1'))   # tier 2
+FILTER_HILOS    = int(os.environ.get('LOOP_FILTER_HILOS', '4'))  # tier 1 (era 2, subido para usar más modelos en paralelo)
+JUDGE_HILOS     = int(os.environ.get('LOOP_JUDGE_HILOS', '2'))   # tier 2 (era 1, subido)
+
+# Quorum del filtro (cuántos modelos deben coincidir para aceptar/refutar).
+# 2 = quórum de 2 modelos por suspect (rápido, barato, suficiente para tier 1).
+# 3 = quórum de 3 (más seguro, más caro). Subir si el filtro es muy ruidoso.
+FILTER_QUORUM   = int(os.environ.get('LOOP_FILTER_QUORUM', '2'))
 FIXER_HILOS     = int(os.environ.get('LOOP_FIXER_HILOS', '1'))   # tier 3
 
 # Watchdog.
@@ -630,8 +635,22 @@ En una segunda línea, una frase corta justificando.
 
 
 def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
-    """Un hilo del filtro. Consume suspectq, filtra escépticamente."""
-    log(f'  [filter-{wid}] arrancando con {[f.id for f in filters]}')
+    """Un hilo del filtro. Consume suspectq, filtra escépticamente con CONSENSO.
+
+    Política de consenso (jul-2026, fix "solo M2.7 se usaba"):
+      · Antes: break en el primer respondiente (M2.7-highspeed ganaba siempre).
+      · Ahora: consultar FILTER_QUORUM modelos en orden round-robin (rotamos
+        el offset por suspect para que todos se usen). Si la mayoría coincide
+        → aceptamos. Si discordia → escalamos a tier 2 (juez) o refutamos
+        conservadoramente (es mejor un falso negativo que un falso positivo
+        en dinero/stock/auth).
+      · Distribución: cada wid arranca con un offset distinto del array de
+        modelos, y rota el offset después de cada suspect. Así garantizamos
+        que los 11 modelos del tier 1 reciben tráfico equilibrado.
+    """
+    log(f'  [filter-{wid}] arrancando con {[f.id for f in filters]} (quorum={FILTER_QUORUM})')
+    n = len(filters)
+    offset = wid % n  # offset inicial distinto por hilo (diversidad)
     while True:
         try:
             s = suspectq.get(timeout=5)
@@ -646,29 +665,66 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
             f'Razón: {s.why}\n\n'
             '¿Es REAL o NOT_A_BUG?'
         )
-        # Probamos todos los filtros en orden hasta que uno responda.
-        for spec in filters:
+        # Round-robin: para cada suspect, rotamos qué modelo arranca.
+        # Así un suspect lo ve (filters[offset], filters[offset+1], ...)
+        # y el siguiente suspect empieza en offset+1.
+        ordered = [filters[(offset + i) % n] for i in range(n)]
+        offset = (offset + 1) % n
+
+        votes: list[tuple[str, str, str]] = []  # (verdict, spec_id, head_text)
+        for spec in ordered[:FILTER_QUORUM + 1]:  # +1 por si uno falla, tener quorum
             text = call_model(spec, FILTER_SYSTEM, prompt, max_tokens=300, timeout=60)
             if not text:
                 continue
             head = text.strip().splitlines()[0].strip().upper()
             if 'REAL' in head and 'NOT' not in head:
-                # Pasa a bugq.
-                try:
-                    bugq.put_nowait(Bug(suspect=s))
-                    log(f'  [filter-{wid}] REAL {s.file}:{s.line} ({spec.id})')
-                except queue.Full:
-                    pass
-                break
+                votes.append(('REAL', spec.id, head))
             elif 'NOT_A_BUG' in head or 'NOT A BUG' in head:
-                MEM.record_false_positive(s.file, s.line, s.snippet,
-                                          reason=text[:200])
-                STATS['suspects_refuted_by_filter'] += 1
-                log(f'  [filter-{wid}] NOT_A_BUG {s.file}:{s.line} ({spec.id})')
-                break
+                votes.append(('NOT_A_BUG', spec.id, head))
+            else:
+                # Output no parseable: lo contamos como "duda"
+                votes.append(('UNCLEAR', spec.id, head))
+            if len(votes) >= FILTER_QUORUM:
+                break  # ya tenemos quorum
+
+        if len(votes) < 2:
+            # Menos de 2 votos: skip silencioso (cuota agotada o modelos caídos)
+            suspectq.task_done()
+            continue
+
+        # Contar votos.
+        real_count = sum(1 for v in votes if v[0] == 'REAL')
+        notbug_count = sum(1 for v in votes if v[0] == 'NOT_A_BUG')
+        unclear_count = sum(1 for v in votes if v[0] == 'UNCLEAR')
+        specs_used = ','.join(v[1] for v in votes)
+
+        if real_count >= 2 or (real_count >= 1 and notbug_count == 0 and unclear_count == 0):
+            # Quorum a favor de REAL: pasa a bugq (jueces lo confirmarán en tier 2).
+            try:
+                bugq.put_nowait(Bug(suspect=s))
+                log(f'  [filter-{wid}] REAL [{real_count}R/{notbug_count}N/{unclear_count}U] '
+                    f'{s.file}:{s.line} ({specs_used})')
+            except queue.Full:
+                pass
+        elif notbug_count >= 2 or (notbug_count >= 1 and real_count == 0 and unclear_count == 0):
+            # Quorum a favor de NOT_A_BUG: refutado.
+            MEM.record_false_positive(s.file, s.line, s.snippet,
+                                      reason=f'consenso {specs_used}')
+            STATS['suspects_refuted_by_filter'] += 1
+            log(f'  [filter-{wid}] NOT_A_BUG [{real_count}R/{notbug_count}N/{unclear_count}U] '
+                f'{s.file}:{s.line} ({specs_used})')
         else:
-            # Nadie respondió; skip silencioso.
-            pass
+            # Discordia: el filtro no decide. Lo dejamos pasar a tier 2 con
+            # un flag "discordia" para que el juez pondere con más cuidado.
+            try:
+                b = Bug(suspect=s)
+                # Marcamos discordia en el log; el juez leerá el contexto.
+                log(f'  [filter-{wid}] DISCORD [{real_count}R/{notbug_count}N/{unclear_count}U] '
+                    f'{s.file}:{s.line} → escalado a juez ({specs_used})')
+                bugq.put_nowait(b)
+                STATS['suspects_filtered_as_known_fp'] += 0  # no es FP
+            except queue.Full:
+                pass
         suspectq.task_done()
 
 

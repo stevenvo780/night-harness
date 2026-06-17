@@ -36,13 +36,71 @@ Lecciones a fuego: el consenso del MISMO modelo chico NO sube precisión (sus fa
 (baja frecuencia), no para CAZAR a alta frecuencia. La solución: una **escalera de costo** con familias
 diversas en capas distintas, **desacoplada por colas**, consumiendo siempre lo más barato primero:
 
-| Tier | Modelo (def.) | Frecuencia | Rol |
+## v6 "Adaptativo" — Cuota-Aware + Memoria Persistente + Cadencia Alta
+
+El v6 reescrito completo (jul-2026) integra el repo
+[`ai-usage-live`](https://github.com/stevenvo780/ai-usage-live) para consumir el
+monitoreo de cuotas en vivo y planificar qué modelo usar en cada llamada. El
+hilo conductor es **minimizar Opus** (caro y escaso) y maximizar Minimax,
+Gemini Flash, Sonnet y locales. Toda llamada del harness pasa por
+`quota.py`, que consulta `ai-usage.sh daily/weekly` (con cache 60s) y filtra
+los modelos cerca del límite antes de cada invocación.
+
+### Tier v6 (modelo → familia → rol → coste relativo 1-10)
+
+| Tier | Modelos (orden) | Rol | Frecuencia |
 |---|---|---|---|
-| **0 · Escáner** | **9B LOCAL** (N hilos, HTTP) | altísima (gratis) | escanea TODO a full (consenso) → marca ventanas sospechosas → `suspectq` |
-| **1 · Filtro** | chiquitos: **Haiku + Gemini-Flash** | media (solo sospechosas) | filtran ESCÉPTICAMENTE el ruido del local; lo sólido → `bugq` |
-| **2 · Jueces** | **Gemini-3-Pro + Codex + Sonnet + 30b-local** | baja (solo confirmado) | REAL vs NOT_A_BUG; escalera barato→caro que corta al confirmar o al ser imposible |
-| **3 · Fixer** | **Codex** → Gemini-Pro → Claude → local | rara (bugs reales) | genera el fix → gate `tsc`+E2E → commit |
-| **4 · Árbitro** | 🏆 **Opus** → Gemini-Pro → Sonnet | rarísima (riesgoso+contestado) | veredicto final |
+| **0 · Escáner local** | `ollama:qwen3.5:9b` (4-6 hilos) + `ollama:qwen3-coder:30b` (2 hilos) | caza sospechas | altísima, gratis |
+| **1 · Filtro** | `minimax:MiniMax-M3` → `gemini:gemini-2.5-flash` → `gemini:gemini-2.5-flash-lite` → `claude:claude-haiku-4-5` | refuta ruido, promoción `suspectq → bugq` | media |
+| **2 · Jueces** | `minimax:MiniMax-M3` → `codex:gpt-5-codex` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-6` | REAL vs NOT_A_BUG (quorum 2/3) | baja |
+| **3 · Fixer** | `codex:gpt-5-codex` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-6` → `ollama:qwen3-coder:30b` | genera fix, gate `tsc`+E2E, commit | rara |
+| **4 · Árbitro** | `claude:claude-sonnet-4-6` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` | veredicto final (SOLO riesgosos) | rarísima |
+| **4bis · Opus último recurso** | `claude:claude-opus-4-6` | solo si 4 falla o discordia | extrema |
+
+### Política Opus (v6)
+
+Opus aparece SOLO si se cumplen LAS 3 condiciones:
+1. **El fix es riesgoso** (`tiers.is_risky_path`): toca dinero, stock, estado, auth, despacho, factura, caja, permiso, admin.
+2. **Los 3 árbitros baratos discordaron** O están todos en cuarentena por cuota.
+3. **`is_model_ok('claude:claude-opus-4-6')` retorna True** según el estado de `ai-usage.sh weekly`.
+
+Cuando se invoca, el harness imprime un banner de aviso único por sesión:
+```
+==============================================================
+  ⚠ OPUS ÚLTIMO RECURSO
+  El harness detectó que ningún árbitro más barato puede decidir.
+  Se invocará claude-opus-4-6 SOLO para fixes riesgosos.
+  Coste aprox: 10x Sonnet. Use con moderación.
+==============================================================
+```
+
+### Control de cuotas (`quota.py`)
+
+Antes de cada llamada a un modelo:
+1. Si el estado en cache tiene < 60s, lo reusa. Si no, corre `JSON=1 ai-usage.sh daily` + `ai-usage.sh weekly` (timeout 30s).
+2. Parsea los `modelBreakdowns` (efectivos = `input + cacheCreation + output`, **excluye cache reads**).
+3. Compara contra `DEFAULT_LIMITS[model]` (sobreescribible por env).
+4. Si el modelo está sobre el límite, se omite de la cadena (cae al siguiente).
+
+Las llamadas hechas por el harness se registran en `quota.record()` para reportar
+gasto local al final del run (los datos llegan a `ai-usage.sh` con delay; el local
+es inmediato).
+
+### Memoria persistente (`memory.py`)
+
+Persiste entre sesiones en `/tmp/loop-memory.json`:
+- **Bugs confirmados**: hash estable (file+line+8 palabras) + veces confirmado + fix commit.
+- **Falsos positivos**: el 9b los marca como `should_skip` si se han visto 2+ veces.
+- **Endurecimiento de zonas**: `clean_rounds >= 3` → la zona se re-escanea con menos prioridad.
+
+API: `Memory.load()`, `MEM.record_bug(...)`, `MEM.record_false_positive(...)`, `MEM.is_hardened(zone)`, `MEM.should_skip(file, line, snippet)`.
+
+### Cadencia alta
+
+- **Multi-escáner**: 4-6 hilos 9b + 2 hilos 30b corren en paralelo (sin contención si `OLLAMA_MAX_LOADED_MODELS>=2`).
+- **Reparación especulativa**: cuando 2+ jueces confirman, el fix se lanza SIN esperar a que el siguiente sospechoso se confirme.
+- **Hot-reload**: cada fix se valida (`tsc`+E2E) y se re-escanea su zona de inmediato.
+- **Converge-and-stop**: `TARGET_CLEAN` rondas sin fix nuevo → código estable, parar.
 
 - **Desacople productor-consumidor:** el escáner local corre a FULL sin esperar a los chiquitos (cola
   `suspectq` de por medio) → el local nunca queda ocioso; los chiquitos consumen a su ritmo.

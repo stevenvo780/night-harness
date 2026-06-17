@@ -84,7 +84,7 @@ class E2EJourney:
 # glm-5.2 vía opencode-go: también 1M context, alternativa.
 ORCHESTRATOR_MODEL = os.environ.get(
     'LOOP_ORCHESTRATOR_MODEL',
-    'opencode-go:glm-5.2',  # 1M ctx, fiable con JSON, vía opencode CLI
+    'minimax/MiniMax-M3',  # 1M ctx, barato, fiable (yo mismo). GLM-5.2 era caro.
 )
 
 # Cuánto contexto del proyecto pasar al modelo (en líneas).

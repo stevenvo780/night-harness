@@ -110,6 +110,83 @@ TIER0_30B_OPINIONS: tuple[ModelSpec, ...] = (
     ),
 )
 
+# Cloud hunters: modelos CHIQUITOS cloud (baratos, rápidos) que también cazan bugs.
+# Multiplican la cadencia y la diversidad de perspectivas.
+TIER0_CLOUD_HUNTERS: tuple[ModelSpec, ...] = (
+    # Gemini Flash Lite: 1M ctx, $0.10/M, barato.
+    ModelSpec(
+        id='gemini:gemini-2.5-flash-lite',
+        family='gemini',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=1_000_000,
+        strengths=('code', 'fast', 'long'),
+    ),
+    # DeepSeek Flash Free: free, rápido, vía opencode.
+    ModelSpec(
+        id='opencode:deepseek-v4-flash-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast', 'reasoning'),
+    ),
+    # North Mini Code Free: free, especializado en código.
+    ModelSpec(
+        id='opencode:north-mini-code-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    # Mimo Free: free, rápido.
+    ModelSpec(
+        id='opencode:mimo-v2.5-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    # Big Pickle Free.
+    ModelSpec(
+        id='opencode:big-pickle',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    # Minimax M2.7-highspeed: el más rápido/barato de minimax.
+    ModelSpec(
+        id='minimax/MiniMax-M2.7-highspeed',
+        family='minimax',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=1_000_000,
+        strengths=('code', 'fast'),
+    ),
+    # Minimax M2.5-highspeed: otra alternativa rápida.
+    ModelSpec(
+        id='minimax/MiniMax-M2.5-highspeed',
+        family='minimax',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=1_000_000,
+        strengths=('code', 'fast'),
+    ),
+    # Claude Haiku: rápido de Anthropic.
+    ModelSpec(
+        id='claude:claude-haiku-4-5',
+        family='claude',
+        role='cloud_mini',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'fast', 'json'),
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Tier 1 — Filtro (CHICO CLOUD, alta cuota, media concurrencia).
 # Filtra las hipótesis del escáner local. Diversidad de familias = 합의 señal.
@@ -587,6 +664,10 @@ def get_tier0_hunters() -> tuple[ModelSpec, ...]:
 
 def get_tier0_30b() -> tuple[ModelSpec, ...]:
     return _load_override('LOOP_TIER0_30B', TIER0_30B_OPINIONS)
+
+
+def get_tier0_cloud_hunters() -> tuple[ModelSpec, ...]:
+    return _load_override('LOOP_TIER0_CLOUD', TIER0_CLOUD_HUNTERS)
 
 
 def get_tier1_filters() -> tuple[ModelSpec, ...]:

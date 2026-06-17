@@ -39,6 +39,7 @@ USO:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import queue
@@ -73,10 +74,11 @@ HOURS       = int(os.environ.get('LOOP_HOURS', '8'))
 TARGET      = int(os.environ.get('LOOP_TARGET', '50'))   # rondas limpias para "endurecer"
 
 # Concurrencia por tier.
-HUNTER_HILOS    = int(os.environ.get('LOOP_HUNTERS', '4'))     # hilos 9b
-SECOND_HILOS    = int(os.environ.get('LOOP_SECOND_HILOS', '2'))  # hilos 30b
-FILTER_HILOS    = int(os.environ.get('LOOP_FILTER_HILOS', '4'))  # tier 1 (era 2, subido para usar más modelos en paralelo)
-JUDGE_HILOS     = int(os.environ.get('LOOP_JUDGE_HILOS', '2'))   # tier 2 (era 1, subido)
+HUNTER_HILOS       = int(os.environ.get('LOOP_HUNTERS', '4'))     # hilos locales
+SECOND_HILOS       = int(os.environ.get('LOOP_SECOND_HILOS', '2'))  # hilos 30b
+CLOUD_HUNTER_HILOS = int(os.environ.get('LOOP_CLOUD_HUNTERS', '6'))  # hilos cloud chiquitos
+FILTER_HILOS       = int(os.environ.get('LOOP_FILTER_HILOS', '6'))  # tier 1
+JUDGE_HILOS        = int(os.environ.get('LOOP_JUDGE_HILOS', '3'))   # tier 2
 
 # Quorum del filtro (cuántos modelos deben coincidir para aceptar/refutar).
 # 2 = quórum de 2 modelos por suspect (rápido, barato, suficiente para tier 1).
@@ -167,12 +169,50 @@ STATS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Estado por-thread (para la TUI dashboard).
+# Cada thread actualiza su entrada en THREAD_STATES con su actividad actual
+# (modelo, archivo, tiempo, calls). La TUI lee esto y muestra un contenedor
+# por proceso.
+# ---------------------------------------------------------------------------
+THREAD_STATES: dict[str, dict] = {}
+THREAD_STATES_LOCK = threading.Lock()
+
+
+def update_thread_state(name: str, **kwargs) -> None:
+    """Actualiza el estado de un thread de forma thread-safe."""
+    with THREAD_STATES_LOCK:
+        if name not in THREAD_STATES:
+            THREAD_STATES[name] = {
+                'kind': '?', 'model': '?', 'status': 'idle',
+                'current_file': '', 'current_task': '',
+                'started_at': time.time(), 'last_update': time.time(),
+                'calls': 0, 'errors': 0, 'avg_ms': 0,
+            }
+        THREAD_STATES[name].update(kwargs)
+        THREAD_STATES[name]['last_update'] = time.time()
+
+
+def get_thread_states() -> list[dict]:
+    """Devuelve copia thread-safe del estado de todos los threads."""
+    with THREAD_STATES_LOCK:
+        out = []
+        for name, s in THREAD_STATES.items():
+            entry = dict(s)
+            entry['name'] = name
+            entry['age_sec'] = int(time.time() - s.get('started_at', time.time()))
+            entry['idle_sec'] = int(time.time() - s.get('last_update', time.time()))
+            out.append(entry)
+        return out
+
+
 def write_status() -> None:
     """Volca el estado para /tmp/loop-v6-status.json (TUI / debug)."""
     payload = {
         'stats': STATS,
         'uptime_sec': int(time.time() - STATS['started_at']),
         'quota': quota.local_spend(),
+        'threads': get_thread_states(),
         'memory': {
             'total_rounds': MEM.total_rounds,
             'total_bugs_found': MEM.total_bugs_found,
@@ -562,8 +602,16 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
             fname = p.file if hasattr(p, 'file') else p.get('file', '')
             prompts_by_file.setdefault(fname, []).append(p)
 
+    # Determinar source: local (ruidoso) vs cloud (preciso).
+    # Cloud hunters saltan el filtro y van directo a jueces.
+    is_cloud = not hunter_spec.id.startswith('ollama:')
+    source_kind = 'cloud' if is_cloud else 'local'
+
     log(f'  [hunter-{wid}] {hunter_spec.id} arrancando ({len(zone_files)} archivos'
-        f'{", orquestador activo" if hunting_prompts else ""})')
+        f'{", orquestador activo" if hunting_prompts else ""}, source={source_kind})')
+    update_thread_state(f'hunter-{wid}', kind=('cloud' if is_cloud else 'hunter'),
+                        model=hunter_spec.id,
+                        status='busy', current_file='', calls=0)
     for file in zone_files:
         path = WT / SUBDIR / file
         if not path.exists():
@@ -577,6 +625,8 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
 
         # Determinar si hay prompts de orquestador para este archivo.
         targeted = prompts_by_file.get(file, []) if hunting_prompts else []
+        update_thread_state(f'hunter-{wid}', current_file=file, status='busy',
+                            current_task=f'revisando ({len(targeted)} pistas)' if targeted else 'revisando')
 
         # Consenso: 3 muestras; solo emitimos si la mayoría coincide.
         for round_n in range(CONSENSUS_N):
@@ -606,6 +656,7 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                     'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
                     'descripción. Si no hay bugs: NO_BUGS.\n'
                 )
+            update_thread_state(f'hunter-{wid}', current_task=f'round {round_n+1}/{CONSENSUS_N}')
             text = call_model(hunter_spec, HUNTER_SYSTEM, prompt, max_tokens=1500)
             if not text or 'NO_BUGS' in text:
                 continue
@@ -622,27 +673,44 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                             snippet=m['snippet'],
                             why=m['why'],
                             samples=1,
-                            source='hunter',
+                            source=source_kind,
                         )
                     )
         log(f'  [hunter-{wid}] {file} revisado')
+        update_thread_state(f'hunter-{wid}', calls=THREAD_STATES.get(f'hunter-{wid}', {}).get('calls', 0) + 1)
 
     log(f'  [hunter-{wid}] {hunter_spec.id} done')
+    update_thread_state(f'hunter-{wid}', status='done', current_task='terminado')
 
 
 def yield_suspect(s: Suspect) -> None:
-    """Encolar un suspect, con dedupe en memoria."""
+    """Encolar un suspect, con dedupe en memoria.
+
+    RUTEO INTELIGENTE (jul-2026):
+      · source='local' (Ollama, ruidoso) → suspectq → filtro → jueces
+      · source='cloud' (gemini, opencode, minimax) → bugq → jueces directo
+        Los modelos cloud son más precisos; saltan el filtro escéptico que
+        siempre dice NOT_A_BUG y bloquea bugs reales.
+    """
     if MEM.should_skip(s.file, s.line, s.snippet):
         STATS['suspects_filtered_as_known_fp'] += 1
         return
-    # Si ya está en la cola o registrado, no encolar.
     if MEM.get_bug(s.file, s.line, s.snippet) and MEM.get_bug(s.file, s.line, s.snippet).fixed:
         return
-    try:
-        suspectq.put_nowait(s)
-        STATS['suspects_produced'] += 1
-    except queue.Full:
-        pass  # cola llena, drop (raro)
+
+    STATS['suspects_produced'] += 1
+    if s.source == 'cloud':
+        # Cloud hunter: a jueces directo (más preciso).
+        try:
+            bugq.put_nowait(Bug(suspect=s))
+            log(f'  [yield] cloud→juez {s.file}:{s.line}')
+        except queue.Full:
+            suspectq.put_nowait(s)  # fallback a filtro si bugq llena
+    else:
+        try:
+            suspectq.put_nowait(s)
+        except queue.Full:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -673,20 +741,22 @@ En una segunda línea, una frase corta justificando.
 def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
     """Un hilo del filtro. Consume suspectq, filtra escépticamente con CONSENSO.
 
-    Política de consenso (jul-2026, fix "solo M2.7 se usaba"):
-      · Antes: break en el primer respondiente (M2.7-highspeed ganaba siempre).
-      · Ahora: consultar FILTER_QUORUM modelos en orden round-robin (rotamos
-        el offset por suspect para que todos se usen). Si la mayoría coincide
-        → aceptamos. Si discordia → escalamos a tier 2 (juez) o refutamos
-        conservadoramente (es mejor un falso negativo que un falso positivo
-        en dinero/stock/auth).
-      · Distribución: cada wid arranca con un offset distinto del array de
-        modelos, y rota el offset después de cada suspect. Así garantizamos
-        que los 11 modelos del tier 1 reciben tráfico equilibrado.
+    Política de consenso NO-BLOQUEANTE (jul-2026, fix paralelismo):
+      · Antes: loop secuencial (esperaba cada modelo uno tras otro). Tiempo total
+        = sum(t_model_i). Con 2 modelos de 15s cada uno → 30s por suspect.
+      · Ahora: ThreadPoolExecutor con FILTER_QUORUM+1 workers en paralelo.
+        Tiempo total = max(t_model_i) hasta tener quorum válido. Con 2 modelos
+        de 15s cada uno → 15s por suspect. ~DOBLA el throughput.
+      · Si un modelo falla/timeout, el futuro retorna ('FAIL', spec_id); los
+        demás siguen contando.
+      · Round-robin: cada wid arranca con un offset distinto; rota por suspect
+        para que todos los modelos reciban tráfico equilibrado.
     """
     log(f'  [filter-{wid}] arrancando con {[f.id for f in filters]} (quorum={FILTER_QUORUM})')
     n = len(filters)
     offset = wid % n  # offset inicial distinto por hilo (diversidad)
+    update_thread_state(f'filter-{wid}', kind='filter', model=filters[offset].id if filters else '?',
+                        status='idle', current_file='', calls=0)
     while True:
         try:
             s = suspectq.get(timeout=5)
@@ -704,51 +774,71 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
         # Round-robin: para cada suspect, rotamos qué modelo arranca.
         # Así un suspect lo ve (filters[offset], filters[offset+1], ...)
         # y el siguiente suspect empieza en offset+1.
-        ordered = [filters[(offset + i) % n] for i in range(n)]
+        ordered = [filters[(offset + i) % n] for i in range(min(FILTER_QUORUM + 1, n))]
         offset = (offset + 1) % n
 
-        votes: list[tuple[str, str, str]] = []  # (verdict, spec_id, head_text)
-        for spec in ordered[:FILTER_QUORUM + 1]:  # +1 por si uno falla, tener quorum
+        update_thread_state(f'filter-{wid}', current_file=s.file, status='busy',
+                            current_task=f'consenso {len(ordered)} modelos')
+
+        # CONSENSO NO-BLOQUEANTE: disparar todos los modelos en paralelo.
+        # Tiempo total = max(t_model_i) en lugar de sum(t_model_i).
+        def _query(spec: tiers.ModelSpec) -> tuple[str, str]:
             text = call_model(spec, FILTER_SYSTEM, prompt, max_tokens=300, timeout=60)
             if not text:
-                continue
+                return ('FAIL', spec.id)
             head = text.strip().splitlines()[0].strip().upper()
             if 'REAL' in head and 'NOT' not in head:
-                votes.append(('REAL', spec.id, head))
+                return ('REAL', spec.id)
             elif 'NOT_A_BUG' in head or 'NOT A BUG' in head:
-                votes.append(('NOT_A_BUG', spec.id, head))
+                return ('NOT_A_BUG', spec.id)
             else:
-                # Output no parseable: lo contamos como "duda"
-                votes.append(('UNCLEAR', spec.id, head))
-            if len(votes) >= FILTER_QUORUM:
-                break  # ya tenemos quorum
+                return ('UNCLEAR', spec.id)
 
-        if len(votes) < 2:
-            # Menos de 2 votos: skip silencioso (cuota agotada o modelos caídos)
+        votes: list[tuple[str, str]] = []
+        specs_used: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ordered)) as pool:
+            futures = {pool.submit(_query, spec): spec for spec in ordered}
+            # Recoger resultados conforme llegan. Salimos cuando tenemos
+            # FILTER_QUORUM votos válidos.
+            for fut in concurrent.futures.as_completed(futures, timeout=120):
+                try:
+                    verdict, spec_id = fut.result(timeout=0.5)
+                except Exception:
+                    continue
+                votes.append((verdict, spec_id))
+                specs_used.append(spec_id)
+                valid_so_far = sum(1 for v in votes if v[0] != 'FAIL')
+                if valid_so_far >= FILTER_QUORUM:
+                    break
+
+        # Contar votos (excluyendo fallos).
+        valid_votes = [v for v in votes if v[0] != 'FAIL']
+        if len(valid_votes) < 2:
+            # Menos de 2 votos válidos: skip silencioso (cuota agotada o modelos caídos)
+            update_thread_state(f'filter-{wid}', current_file='', status='idle', current_task='')
             suspectq.task_done()
             continue
 
-        # Contar votos.
-        real_count = sum(1 for v in votes if v[0] == 'REAL')
-        notbug_count = sum(1 for v in votes if v[0] == 'NOT_A_BUG')
-        unclear_count = sum(1 for v in votes if v[0] == 'UNCLEAR')
-        specs_used = ','.join(v[1] for v in votes)
+        real_count = sum(1 for v in valid_votes if v[0] == 'REAL')
+        notbug_count = sum(1 for v in valid_votes if v[0] == 'NOT_A_BUG')
+        unclear_count = sum(1 for v in valid_votes if v[0] == 'UNCLEAR')
+        specs_used_str = ','.join(s.split('/')[-1][:20] for s in specs_used[:FILTER_QUORUM])
 
         if real_count >= 2 or (real_count >= 1 and notbug_count == 0 and unclear_count == 0):
             # Quorum a favor de REAL: pasa a bugq (jueces lo confirmarán en tier 2).
             try:
                 bugq.put_nowait(Bug(suspect=s))
                 log(f'  [filter-{wid}] REAL [{real_count}R/{notbug_count}N/{unclear_count}U] '
-                    f'{s.file}:{s.line} ({specs_used})')
+                    f'{s.file}:{s.line} ({specs_used_str})')
             except queue.Full:
                 pass
         elif notbug_count >= 2 or (notbug_count >= 1 and real_count == 0 and unclear_count == 0):
             # Quorum a favor de NOT_A_BUG: refutado.
             MEM.record_false_positive(s.file, s.line, s.snippet,
-                                      reason=f'consenso {specs_used}')
+                                      reason=f'consenso {specs_used_str}')
             STATS['suspects_refuted_by_filter'] += 1
             log(f'  [filter-{wid}] NOT_A_BUG [{real_count}R/{notbug_count}N/{unclear_count}U] '
-                f'{s.file}:{s.line} ({specs_used})')
+                f'{s.file}:{s.line} ({specs_used_str})')
         else:
             # Discordia: el filtro no decide. Lo dejamos pasar a tier 2 con
             # un flag "discordia" para que el juez pondere con más cuidado.
@@ -756,11 +846,17 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
                 b = Bug(suspect=s)
                 # Marcamos discordia en el log; el juez leerá el contexto.
                 log(f'  [filter-{wid}] DISCORD [{real_count}R/{notbug_count}N/{unclear_count}U] '
-                    f'{s.file}:{s.line} → escalado a juez ({specs_used})')
+                    f'{s.file}:{s.line} → escalado a juez ({specs_used_str})')
                 bugq.put_nowait(b)
                 STATS['suspects_filtered_as_known_fp'] += 0  # no es FP
             except queue.Full:
                 pass
+
+        # Actualizar contadores del thread.
+        with THREAD_STATES_LOCK:
+            t = THREAD_STATES.get(f'filter-{wid}', {})
+            t['calls'] = t.get('calls', 0) + 1
+        update_thread_state(f'filter-{wid}', current_file='', status='idle', current_task='')
         suspectq.task_done()
 
 
@@ -787,11 +883,15 @@ Justificación en 1-2 frases.
 
 def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
     log(f'  [judge-{wid}] arrancando con {[j.id for j in judges]}')
+    update_thread_state(f'judge-{wid}', kind='judge',
+                        model=judges[0].id if judges else '?',
+                        status='idle', current_file='', calls=0)
     while True:
         try:
             bug = bugq.get(timeout=5)
         except queue.Empty:
             if shutdown.is_set() and bugq.empty():
+                update_thread_state(f'judge-{wid}', status='done')
                 return
             continue
 
@@ -801,17 +901,35 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
             f'Razón original: {bug.suspect.why}\n\n'
             '¿Es REAL, NOT_A_BUG, o WONT_FIX?'
         )
-        for spec in judges:
+        update_thread_state(f'judge-{wid}', current_file=bug.suspect.file,
+                            status='busy', current_task=f'juzgando {len(judges)} modelos')
+
+        # TAMBIÉN paralelo: lanzar todos los jueces en paralelo.
+        def _judge_query(spec: tiers.ModelSpec) -> tuple[str, str]:
             text = call_model(spec, JUDGE_SYSTEM, prompt, max_tokens=400, timeout=60)
             if not text:
-                continue
+                return ('FAIL', spec.id)
             head = text.strip().splitlines()[0].strip().upper()
-            bug.voters.append(spec.id)
             if 'REAL' in head and 'NOT' not in head:
-                bug.votes_real += 1
+                return ('REAL', spec.id)
             elif 'NOT_A_BUG' in head or 'NOT A BUG' in head:
-                bug.votes_not_bug += 1
-            # WONT_FIX no incrementa votos.
+                return ('NOT_A_BUG', spec.id)
+            else:
+                return ('WONT_FIX', spec.id)  # WONT_FIX no suma votos
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(judges)) as pool:
+            futures = {pool.submit(_judge_query, spec): spec for spec in judges}
+            for fut in concurrent.futures.as_completed(futures, timeout=120):
+                try:
+                    verdict, spec_id = fut.result(timeout=0.5)
+                except Exception:
+                    continue
+                bug.voters.append(spec_id)
+                if verdict == 'REAL':
+                    bug.votes_real += 1
+                elif verdict == 'NOT_A_BUG':
+                    bug.votes_not_bug += 1
+                # WONT_FIX y FAIL no suman
 
         # Quorum.
         if bug.votes_real >= JUDGE_MIN and bug.votes_real > bug.votes_not_bug:
@@ -827,6 +945,10 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
             MEM.record_false_positive(bug.suspect.file, bug.suspect.line,
                                       bug.suspect.snippet,
                                       reason=f'{bug.votes_real}REAL/{bug.votes_not_bug}NOT')
+        with THREAD_STATES_LOCK:
+            t = THREAD_STATES.get(f'judge-{wid}', {})
+            t['calls'] = t.get('calls', 0) + 1
+        update_thread_state(f'judge-{wid}', current_file='', status='idle', current_task='')
         bugq.task_done()
 
 
@@ -838,10 +960,14 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
 def fixer_worker(bug: Bug) -> None:
     log(f'  [fixer] {bug.suspect.file}:{bug.suspect.line} arrancando')
     STATS['fixes_attempted'] += 1
+    update_thread_state(f'fixer-{bug.suspect.file}', kind='fixer',
+                        model='?', status='busy',
+                        current_file=bug.suspect.file, calls=1)
 
     fixers = quota.filter_tier(tiers.get_tier3_fixers(), 'fixer')
     if not fixers:
         log('  [fixer] no hay fixers disponibles (todos en cuarentena)')
+        update_thread_state(f'fixer-{bug.suspect.file}', status='done', current_task='sin fixers')
         return
 
     # Leer el código actual.
@@ -891,6 +1017,8 @@ def fixer_worker(bug: Bug) -> None:
             else:
                 # Aplicado pero no comiteado (validó pero git falló).
                 log(f'  [fixer] aplicado pero sin commit: {path}')
+            update_thread_state(f'fixer-{bug.suspect.file}', status='done',
+                                current_task='OK')
             return
         else:
             # Validación falló: revertir y probar siguiente fixer.
@@ -898,6 +1026,8 @@ def fixer_worker(bug: Bug) -> None:
             log(f'  [fixer] {spec.id} falló la validación, revertido')
 
     log(f'  [fixer] TODOS los fixers fallaron para {bug.suspect.file}:{bug.suspect.line}')
+    update_thread_state(f'fixer-{bug.suspect.file}', status='done',
+                        current_task='todos fallaron')
 
 
 def _apply_and_validate(path: Path, new_content: str, suspect: Suspect) -> bool:
@@ -1179,6 +1309,7 @@ def main() -> None:
     # Cargar tiers filtrados por cuota.
     hunter_specs = quota.filter_tier(tiers.get_tier0_hunters(), 'tier0') or list(tiers.TIER0_HUNTERS)
     second_specs = quota.filter_tier(tiers.get_tier0_30b(), 'tier0') or list(tiers.TIER0_30B_OPINIONS)
+    cloud_hunter_specs = quota.filter_tier(tiers.get_tier0_cloud_hunters(), 'tier0') or list(tiers.TIER0_CLOUD_HUNTERS)
     filter_specs = quota.filter_tier(tiers.get_tier1_filters(), 'tier1') or list(tiers.TIER1_FILTERS)
     judge_specs = quota.filter_tier(tiers.get_tier2_judges(), 'tier2')[:JUDGE_TOTAL] or list(tiers.TIER2_JUDGES[:JUDGE_TOTAL])
 
@@ -1213,6 +1344,7 @@ def main() -> None:
             pass
     log(f'  Hunter specs activos:  {[s.id for s in hunter_specs]}')
     log(f'  Second specs activos:  {[s.id for s in second_specs]}')
+    log(f'  Cloud hunter specs:    {[s.id for s in cloud_hunter_specs]}')
     log(f'  Filter specs activos:  {[s.id for s in filter_specs]}')
     log(f'  Judge specs activos:   {[s.id for s in judge_specs]}')
     log('')
@@ -1278,6 +1410,18 @@ def main() -> None:
         )
         t.start()
         second_threads.append(t)
+
+    # Arranque de workers tier 0 CLOUD (modelos chiquitos baratos).
+    for i in range(CLOUD_HUNTER_HILOS):
+        t = threading.Thread(
+            target=hunter_worker,
+            args=(code_zones[(i + HUNTER_HILOS + SECOND_HILOS) % len(code_zones)],
+                  cloud_hunter_specs[i % len(cloud_hunter_specs)], i),
+            kwargs={'hunting_prompts': hunting_prompts},
+            daemon=True,
+            name=f'cloud-{i}',
+        )
+        t.start()
 
     # Arranque de workers tier 1 (filtros).
     for i in range(FILTER_HILOS):

@@ -15,12 +15,21 @@ Teclas:
   r / R    forzar refresh inmediato
   p / P    pausar/reanudar auto-refresh
   c / C    limpiar el log mostrado
-  l / L    cambiar layout (compact/full/metrics-only)
+  TAB      ciclar entre tabs (Dashboard / Models / Logs / Stats)
+  1..4     ir directo a una tab
+  l / L    cambiar layout (legacy: compact/full/metrics)
   m / M    configurar modelos por tier
   s / S    lanzar / detener ciclo del harness
   d / D    cambiar duración del ciclo (1h/2h/4h/8h/indefinido)
   ?        ayuda
   ↑/↓      scroll en el panel de log
+
+Tabs:
+  Dashboard   Cuadrícula de contenedores por thread (hunters, filters, judges, fixers)
+              con modelo, archivo actual, status, calls.
+  Models      Cadencia por modelo + sistema (CPU/GPU/Ollama).
+  Logs        Log completo a pantalla completa.
+  Stats       Contadores y memoria del harness.
 
 USO:
   ./tui.py [STATUS_FILE] [LOG_FILE]
@@ -379,6 +388,8 @@ def _default_model_config() -> dict:
         # Importamos tiers.py si está disponible.
         import tiers
         return {
+            'tier0_local': [s.id for s in tiers.TIER0_HUNTERS],
+            'tier0_cloud': [s.id for s in tiers.TIER0_CLOUD_HUNTERS],
             'tier1_filters': [s.id for s in tiers.TIER1_FILTERS],
             'tier2_judges': [s.id for s in tiers.TIER2_JUDGES],
             'tier3_fixers': [s.id for s in tiers.TIER3_FIXERS],
@@ -386,6 +397,8 @@ def _default_model_config() -> dict:
         }
     except ImportError:
         return {
+            'tier0_local': [],
+            'tier0_cloud': [],
             'tier1_filters': [],
             'tier2_judges': [],
             'tier3_fixers': [],
@@ -397,6 +410,8 @@ def _show_model_config(stdscr, config: dict) -> dict:
     """Pantalla de selección de modelos por tier. Devuelve la nueva config."""
     h, w = stdscr.getmaxyx()
     tiers_list = [
+        ('Tier 0 · Hunters local', 'tier0_local', 'Cazan bugs (locales)'),
+        ('Tier 0 · Hunters cloud', 'tier0_cloud', 'Cazan bugs (chiquitos)'),
         ('Tier 1 · Filtros', 'tier1_filters', 'Refutan ruido (baratos)'),
         ('Tier 2 · Jueces', 'tier2_judges', 'Confirman bugs (medios)'),
         ('Tier 3 · Fixers', 'tier3_fixers', 'Generan fixes (fuertes)'),
@@ -663,14 +678,175 @@ def draw_log_panel(stdscr, log_buffer: LogBuffer, y: int, height: int) -> int:
     return y
 
 
-def draw_footer(stdscr, paused: bool, layout: str):
+def draw_footer(stdscr, paused: bool, current_tab: str):
     h, w = stdscr.getmaxyx()
     stdscr.addstr(h - 1, 1, '═' * (w - 2), curses.color_pair(COLOR_PAIR_HEADER))
-    keys = "  q:salir  r:refresh  p:pausar({})  l:layout({})  ?:ayuda  ".format(
-        "ON" if paused else "off", layout,
+    keys = "  q:salir  r:refresh  p:pausar({})  TAB:tab({})  m:modelos  s:start/stop  d:duración  ?:ayuda  ".format(
+        "ON" if paused else "off", current_tab,
     )
     stdscr.addstr(h - 1, max(1, (w - len(keys)) // 2), keys,
                  gray_attr())
+
+
+# ---------------------------------------------------------------------------
+# Tabs y vistas nuevas (jul-2026: dashboard con contenedores por proceso).
+# ---------------------------------------------------------------------------
+
+TABS = [
+    ('dashboard', '⟦Dashboard⟧'),
+    ('models',    'Modelos'),
+    ('logs',      'Logs'),
+    ('stats',     'Stats'),
+]
+
+
+def draw_tabs_header(stdscr, current_tab: str, y: int = 0) -> int:
+    """Dibuja la barra de tabs en la parte superior. Devuelve la siguiente Y libre."""
+    h, w = stdscr.getmaxyx()
+    line = '  '
+    for tab_id, label in TABS:
+        if tab_id == current_tab:
+            line += f'⟦{label}⟧  '
+        else:
+            line += f' {label}  '
+    line += '   (TAB: cambiar)'
+    stdscr.addstr(y, 1, line[:w - 2], curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
+    stdscr.addstr(y + 1, 1, '─' * (w - 2), gray_attr())
+    return y + 2
+
+
+def _short_model(mid: str) -> str:
+    """Acorta un model id para que quepa en una caja: 'opencode-go:qwen3.7-max' → 'qwen3.7-max'."""
+    if ':' in mid:
+        return mid.split(':', 1)[1]
+    if '/' in mid:
+        return mid.split('/', 1)[-1]
+    return mid
+
+
+def draw_process_containers(stdscr, status: dict, y: int) -> int:
+    """Dashboard tab: 1 contenedor por CATEGORÍA (hunters, cloud, filters, judges, fixers).
+
+    Cada contenedor muestra: nombre de la categoría, estado (activos/total),
+    y lista de agentes con su modelo, calls, y archivo actual.
+    """
+    h, w = stdscr.getmaxyx()
+    threads = status.get('threads', [])
+    if not threads:
+        stdscr.addstr(y, 1, '  (sin threads aún — esperando arranque)',
+                     curses.color_pair(COLOR_PAIR_DEFAULT) | curses.A_DIM)
+        return y + 2
+
+    # Agrupar por kind.
+    cats = {
+        'hunter': ('⟦CAZADORES locales⟧', COLOR_PAIR_HEADER),
+        'cloud':  ('⟦CAZADORES cloud⟧', COLOR_PAIR_GREEN),
+        'filter': ('⟦FILTROS⟧', COLOR_PAIR_DEFAULT),
+        'judge':  ('⟦JUECES⟧', COLOR_PAIR_MAGENTA),
+        'fixer':  ('⟦FIXERS⟧', COLOR_PAIR_RED),
+    }
+    grouped: dict[str, list[dict]] = {}
+    for t in threads:
+        k = t.get('kind', 'other')
+        grouped.setdefault(k, []).append(t)
+
+    box_w = max(45, w - 4)
+    current_y = y
+    for cat_key, (cat_label, cat_color) in cats.items():
+        agents = grouped.get(cat_key, [])
+        if not agents:
+            continue
+        busy = sum(1 for a in agents if a.get('status') == 'busy')
+        idle_count = sum(1 for a in agents if a.get('status') == 'idle')
+        total_calls = sum(a.get('calls', 0) for a in agents)
+        n = len(agents)
+        box_h = 3 + min(n, 8)  # 3 líneas de header + 1 por agente (max 8)
+        if current_y + box_h >= h - 3:
+            break
+
+        bx, by = 1, current_y
+        # Marco.
+        try:
+            stdscr.addstr(by, bx, '╔' + '═' * (box_w - 2) + '╗',
+                         curses.color_pair(cat_color) | curses.A_BOLD)
+            for li in range(1, box_h):
+                stdscr.addstr(by + li, bx, '║', curses.color_pair(cat_color) | curses.A_BOLD)
+                stdscr.addstr(by + li, bx + box_w - 1, '║',
+                             curses.color_pair(cat_color) | curses.A_BOLD)
+            stdscr.addstr(by + box_h, bx, '╚' + '═' * (box_w - 2) + '╝',
+                         curses.color_pair(cat_color) | curses.A_BOLD)
+        except curses.error:
+            pass
+        # Header.
+        header = f' {cat_label}    {busy} activos / {n} total    calls={total_calls}'
+        stdscr.addstr(by + 1, bx + 2, header[:box_w - 4],
+                      curses.color_pair(cat_color) | curses.A_BOLD)
+        # Línea separadora.
+        stdscr.addstr(by + 2, bx + 1, '─' * (box_w - 2), gray_attr())
+        # Agentes (máximo 8).
+        agent_y = by + 3
+        for a in agents[:8]:
+            name = a.get('name', '?')
+            model_s = _short_model(a.get('model', '?'))
+            status_s = a.get('status', 'idle')
+            calls = a.get('calls', 0)
+            file_s = (a.get('current_file', '') or '')[-35:]
+            task_s = (a.get('current_task', '') or '')[:20]
+            # Color por status.
+            sc = (COLOR_PAIR_GREEN | curses.A_BOLD if status_s == 'busy'
+                  else gray_attr())
+            line = (f'  {name:10s} [{status_s:4s}] {model_s:22s} '
+                    f'calls={calls:>3}  {task_s}')
+            try:
+                stdscr.addstr(agent_y, bx + 2, line[:box_w - 4],
+                             curses.color_pair(COLOR_PAIR_DEFAULT))
+                if file_s:
+                    stdscr.addstr(agent_y + 1, bx + 4, f'└─ {file_s}'[:box_w - 6],
+                                  gray_attr())
+                    agent_y += 1
+            except curses.error:
+                pass
+            agent_y += 1
+        current_y = by + box_h + 1
+    return current_y
+
+
+def draw_stats_panel(stdscr, status: dict, y: int) -> int:
+    """Stats tab: muestra contadores, memoria, y el orcador."""
+    h, w = stdscr.getmaxyx()
+    stats = status.get('stats', {})
+    memory = status.get('memory', {})
+    uptime = status.get('uptime_sec', 0)
+    lines = [
+        f'  Uptime:  {uptime//3600:>3}h {(uptime%3600)//60:>2}m {uptime%60:>2}s',
+        f'  Rounds:  {stats.get("rounds", 0)}  |  Clean in a row: {stats.get("clean_rounds_in_a_row", 0)}',
+        f'  Suspects producidos:    {stats.get("suspects_produced", 0)}',
+        f'  Refutados por filtro:   {stats.get("suspects_refuted_by_filter", 0)}',
+        f'  FP conocidos:           {stats.get("suspects_filtered_as_known_fp", 0)}',
+        f'  ─────────────────────────────────────────',
+        f'  Bugs confirmados:       {stats.get("bugs_confirmed", 0)}',
+        f'  Fixes intentados:       {stats.get("fixes_attempted", 0)}',
+        f'  Fixes OK:               {stats.get("fixes_succeeded", 0)}',
+        f'  Fixes revertidos:       {stats.get("fixes_reverted", 0)}',
+        f'  Fixes a revisar:        {stats.get("fixes_to_review", 0)}',
+        f'  E2E findings:           {stats.get("e2e_findings", 0)}',
+        f'  Opus invocaciones:      {stats.get("opus_invocations", 0)}',
+        f'  ─────────────────────────────────────────',
+        f'  Memoria:',
+        f'    Total rounds:    {memory.get("total_rounds", 0)}',
+        f'    Bugs encontrados: {memory.get("total_bugs_found", 0)}',
+        f'    Fixes aplicados: {memory.get("total_fixes_applied", 0)}',
+        f'    Open bugs:       {memory.get("open_bugs", 0)}',
+        f'    Zonas hardened:  {memory.get("hardened_zones", 0)}',
+    ]
+    for i, line in enumerate(lines):
+        if y + i >= h - 1:
+            break
+        try:
+            stdscr.addstr(y + i, 1, line[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+        except curses.error:
+            pass
+    return y + len(lines) + 1
 
 
 def main(stdscr):
@@ -701,7 +877,8 @@ def main(stdscr):
     harness_pid = int(open(HARNESS_PID_FILE).read().strip()) if os.path.exists(HARNESS_PID_FILE) else 0
 
     paused = False
-    layout = 'full'  # 'full' | 'compact' | 'metrics'
+    current_tab = 'dashboard'  # 'dashboard' | 'models' | 'logs' | 'stats'
+    layout = 'full'  # 'full' | 'compact' | 'metrics' (legacy, ahora se ignora)
     cycle_duration = int(os.environ.get('LOOP_HOURS', '8'))  # horas del ciclo
     cycle_launched = False  # true cuando lanzamos un ciclo desde la TUI
     model_config = _load_model_config(MODELS_CONFIG_FILE)
@@ -794,6 +971,19 @@ def main(stdscr):
             log.lines.clear()
         elif key in (ord('l'), ord('L')):
             layout = {'full': 'compact', 'compact': 'metrics', 'metrics': 'full'}[layout]
+        elif key == 9:  # TAB
+            # Cycle through tabs.
+            ids = [t[0] for t in TABS]
+            current_tab = ids[(ids.index(current_tab) + 1) % len(ids)]
+            log.lines.clear() if current_tab == 'logs' else None
+        elif key in (ord('1'),):
+            current_tab = 'dashboard'
+        elif key in (ord('2'),):
+            current_tab = 'models'
+        elif key in (ord('3'),):
+            current_tab = 'logs'
+        elif key in (ord('4'),):
+            current_tab = 'stats'
         elif key == curses.KEY_UP:
             log.scroll_up(3)
         elif key == curses.KEY_DOWN:
@@ -806,7 +996,9 @@ def main(stdscr):
                 "  r / R     forzar refresh inmediato",
                 "  p / P     pausar / reanudar auto-refresh",
                 "  c / C     limpiar log mostrado",
-                "  l / L     cambiar layout (full / compact / metrics)",
+                "  TAB       ciclar entre tabs (Dashboard/Models/Logs/Stats)",
+                "  1..4      ir directo a una tab",
+                "  l / L     cambiar layout (legacy)",
                 "  m / M     configurar modelos por tier",
                 "  s / S     lanzar / detener ciclo del harness",
                 "  d / D     cambiar duración del ciclo",
@@ -871,32 +1063,35 @@ def main(stdscr):
         # Header.
         harness_alive = harness_pid and check_alive(harness_pid)
         y = draw_header(stdscr, last_status, harness_alive, y=0)
-        # Layouts.
-        if layout == 'full':
-            # Cadencia (40% de la pantalla disponible).
-            cad_h = max(4, (h - y) // 3)
-            y = draw_cadence_panel(stdscr, last_counts, y, cad_h)
-            # Sistema.
-            sys_h = 8
-            y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
-            # Log.
-            y = draw_log_panel(stdscr, log, y, h - y - 2)
-        elif layout == 'compact':
-            # Una sola línea de cadencia + sistema + log completo.
-            cad_h = max(3, len(last_counts) + 2)
-            y = draw_cadence_panel(stdscr, last_counts, y, cad_h)
-            y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
-            y = draw_log_panel(stdscr, log, y, h - y - 2)
-        else:  # metrics
-            # Solo cadencia + sistema.
+        # Tabs header.
+        y = draw_tabs_header(stdscr, current_tab, y=y)
+        # Render según tab activa.
+        if current_tab == 'dashboard':
+            # Cuadrícula de contenedores por thread.
+            y = draw_process_containers(stdscr, last_status, y)
+            # Sistema compacto abajo.
+            if y < h - 12:
+                y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
+            # Mini log al final.
+            if y < h - 4:
+                y = draw_log_panel(stdscr, log, y, h - y - 2)
+        elif current_tab == 'models':
+            # Cadencia + sistema (vista de modelos).
             cad_h = max(4, len(last_counts) + 2)
             y = draw_cadence_panel(stdscr, last_counts, y, cad_h)
             y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
-            y += 1
-            stdscr.addstr(y, 1, "  (layout 'metrics': log oculto — pulsa 'l' para cambiar)",
-                         gray_attr())
+            if y < h - 4:
+                y = draw_log_panel(stdscr, log, y, h - y - 2)
+        elif current_tab == 'logs':
+            # Log full screen.
+            y = draw_log_panel(stdscr, log, y, h - y - 2)
+        elif current_tab == 'stats':
+            # Stats + log mini.
+            y = draw_stats_panel(stdscr, last_status, y)
+            if y < h - 4:
+                y = draw_log_panel(stdscr, log, y, h - y - 2)
         # Footer.
-        draw_footer(stdscr, paused, layout)
+        draw_footer(stdscr, paused, current_tab)
         stdscr.refresh()
         time.sleep(0.1)
 

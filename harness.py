@@ -225,6 +225,8 @@ def call_model(spec: tiers.ModelSpec, system: str, prompt: str, max_tokens: int 
             text = _call_ollama(spec, prompt, system, max_tokens, timeout)
         elif spec.id.startswith('minimax/') or spec.id.startswith('minimax:'):
             text = _call_minimax(spec, prompt, system, max_tokens, timeout)
+        elif spec.id.startswith('opencode:') or spec.id.startswith('opencode-go:'):
+            text = _call_opencode(spec, prompt, system, max_tokens, timeout)
         elif spec.id.startswith('gemini:'):
             text = _call_gemini_cli(spec, prompt, system, max_tokens, timeout)
         elif spec.id.startswith('claude:'):
@@ -329,6 +331,48 @@ def _call_minimax_http(model: str, prompt: str, max_tokens: int, timeout: int) -
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
     return data['choices'][0]['message']['content'].strip()
+
+
+def _call_opencode(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
+                   timeout: int) -> str:
+    """Invoca un modelo opencode u opencode-go vía el CLI `opencode run`.
+
+    Formato del id: 'opencode:deepseek-v4-flash-free' o 'opencode-go:glm-5.2'.
+    OpenCode espera el formato `provider/model` con SLASH (no dos puntos),
+    así que convertimos `opencode-go:glm-5.2` → `opencode-go/glm-5.2` al
+    invocar. La key opencode-go la lee opencode de `API_KEY` env var.
+
+    Probado en jul-2026: los 5 free + los 8 pro responden en 4-25s.
+    """
+    # Convertir formato `provider:model` a `provider/model` que opencode espera.
+    opencode_model_id = spec.id.replace(':', '/', 1)
+    full_prompt = (f'<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}' if system else prompt)
+    try:
+        # OpenCode tarda en arrancar (~3s) + latencia del modelo (4-25s).
+        # Timeout por defecto 60s; estirar a 180s para prompts grandes.
+        actual_timeout = max(timeout, 180)
+        result = subprocess.run(
+            ['opencode', 'run', '--model', opencode_model_id, full_prompt],
+            capture_output=True,
+            text=True,
+            timeout=actual_timeout,
+        )
+        out = result.stdout.strip()
+        if not out and result.stderr:
+            # opencode loguea el error a stderr; mostrarlo.
+            log(f'  [opencode] {opencode_model_id} stderr: {result.stderr[:200]}')
+        # Filtrar las líneas de "build" que opencode-go antepone.
+        out = '\n'.join(
+            line for line in out.split('\n')
+            if not line.startswith('[0m') and 'build ·' not in line
+        ).strip()
+        return out
+    except FileNotFoundError:
+        log(f'  [opencode] CLI `opencode` no encontrado en PATH')
+        return ''
+    except subprocess.TimeoutExpired:
+        log(f'  [opencode] {opencode_model_id} timeout {actual_timeout}s')
+        return ''
 
 
 def _call_claude_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
@@ -1018,7 +1062,25 @@ def main() -> None:
     log(f'  Target clean rounds:   {TARGET}')
     log(f'  Hours budget:          {HOURS}')
     log('')
-    log(quota.report())
+    log('  Pre-warming quota cache (no bloqueante, 30s timeout)...')
+    # El primer refresh puede tardar 30s+. Lo hacemos en un thread daemon
+    # para no bloquear el arranque. Si no termina a los 30s, seguimos
+    # con el cache vacío (todos los modelos cloud se tratarán como OK,
+    # que es el comportamiento conservador inicial).
+    quota_ready = threading.Event()
+    def _warm_quota():
+        try:
+            quota.refresh(force=True)
+        except Exception as e:
+            log(f'  [quota] warm falló: {e}')
+        finally:
+            quota_ready.set()
+    threading.Thread(target=_warm_quota, daemon=True, name='quota-warm').start()
+    quota_ready.wait(timeout=30)
+    if quota_ready.is_set():
+        log(quota.report())
+    else:
+        log('  [quota] warm no terminó en 30s; arrancando con cache vacío (todos los modelos pasan)')
     log(MEM.summary())
     log('')
 
@@ -1093,7 +1155,9 @@ def main() -> None:
                 target=e2e_sweep_worker, args=(zone,), daemon=True, name=f'e2e-{zone}'
             ).start()
 
-    # Main loop: converge-and-stop.
+    # Main loop: converge-and-stop. NO termina el run prematuramente;
+    # solo avisa cuando hay N rondas limpias (el código está estable). El run
+    # termina por `deadline` (HOURS), no por converge.
     deadline = time.time() + HOURS * 3600
     last_status = 0
     try:
@@ -1113,8 +1177,10 @@ def main() -> None:
                 write_status()
 
             if STATS['clean_rounds_in_a_row'] >= TARGET:
-                log(f'  [main] converge-and-stop: {TARGET} rondas limpias, código estable')
-                break
+                # NO break — solo avisamos. El run sigue hasta `deadline`.
+                log(f'  [main] converge-adv: {STATS["clean_rounds_in_a_row"]} rondas '
+                    f'limpias (target={TARGET}), código estable. Continuando '
+                    f'hasta deadline ({int((deadline-time.time())/60)}m restantes).')
     except KeyboardInterrupt:
         log('  [main] KeyboardInterrupt, parando...')
 

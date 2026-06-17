@@ -212,11 +212,19 @@ def is_model_ok(model_id: str) -> bool:
       · Modelos locales (`ollama:*`): SIEMPRE OK — son ILIMITADOS (no consumen
         quota cloud, la máquina es local y potente). Aprovechamos el paralelismo
         al máximo.
+      · Modelos opencode / opencode-go (jul-2026, key del usuario): SIEMPRE OK.
+        OpenCode no expone tracking de quota; el coste está implícito en la key.
+        Si la key falla, el modelo retorna 401 y el caller cae al siguiente.
       · Sin datos del cloud → True (deja pasar; el caller decide si gastar).
       · Con datos del cloud → comparar contra DEFAULT_LIMITS.
     """
     # Local: infinito. No se consulta quota, no se registra en call_log.
     if model_id.startswith('ollama:'):
+        return True
+
+    # OpenCode (free + pro): sin tracking, asume OK. Si la key falla, el caller
+    # lo descubre al invocar y cae al siguiente tier.
+    if model_id.startswith('opencode:') or model_id.startswith('opencode-go:'):
         return True
 
     state = refresh()

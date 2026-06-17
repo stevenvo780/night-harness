@@ -1,3 +1,13 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Keys / secrets — NUNCA commitear
+.env
+.env.local
+.env.*.local
+*.key
+*sk-LwHG*
+*API_KEY*
+/tmp/*-key*
+/tmp/test-or*

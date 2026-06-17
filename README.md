@@ -50,12 +50,30 @@ los modelos cerca del límite antes de cada invocación.
 
 | Tier | Modelos (orden) | Rol | Frecuencia |
 |---|---|---|---|
-| **0 · Escáner local** | `ollama:qwen3.5:9b` (4-6 hilos) + `ollama:qwen3-coder:30b` (2 hilos) | caza sospechas | altísima, gratis |
-| **1 · Filtro** | `minimax:MiniMax-M3` → `gemini:gemini-2.5-flash` → `gemini:gemini-2.5-flash-lite` → `claude:claude-haiku-4-5` | refuta ruido, promoción `suspectq → bugq` | media |
-| **2 · Jueces** | `minimax:MiniMax-M3` → `codex:gpt-5-codex` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-6` | REAL vs NOT_A_BUG (quorum 2/3) | baja |
-| **3 · Fixer** | `codex:gpt-5-codex` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-6` → `ollama:qwen3-coder:30b` | genera fix, gate `tsc`+E2E, commit | rara |
-| **4 · Árbitro** | `claude:claude-sonnet-4-6` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` | veredicto final (SOLO riesgosos) | rarísima |
+| **0 · Escáner local** | `ollama:qwen3-coder:30b` (GPU) + `ollama:qwen3-coder-next:cpu` (CPU) | caza sospechas | altísima, gratis |
+| **1 · Filtro** | `minimax:MiniMax-M3` → `gemini:gemini-2.5-flash-lite` → `claude:claude-haiku-4-5` + **5 free opencode** (`deepseek-v4-flash-free`, `north-mini-code-free`, `mimo-v2.5-free`, `big-pickle`, `nemotron-3-ultra-free`) | refuta ruido, promoción `suspectq → bugq` | media |
+| **2 · Jueces** | `minimax:MiniMax-M3` → `codex:gpt-5.5` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-5` + **3 opencode-go pro** (`kimi-k2.7-code`, `deepseek-v4-pro`, `glm-5.2`) | REAL vs NOT_A_BUG (quorum 2/3) | baja |
+| **3 · Fixer** | `codex:gpt-5.5` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-5` → `ollama:qwen3-coder:30b` + **3 opencode-go pro** (`qwen3.7-max`, `deepseek-v4-pro`, `kimi-k2.7-code`) | genera fix, gate `tsc`+E2E, commit | rara |
+| **4 · Árbitro** | `ollama:qwen3-coder:30b` → `claude:claude-sonnet-4-5` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` + **3 opencode-go pro** (`qwen3.7-max`, `glm-5.2`, `kimi-k2.7-code`) | veredicto final (SOLO riesgosos) | rarísima |
 | **4bis · Opus último recurso** | `claude:claude-opus-4-6` | solo si 4 falla o discordia | extrema |
+
+#### OpenCode-go provider (jul-2026, 13 modelos)
+
+Pool añadido tras integración de la key opencode-go del usuario. **Sin coste para
+el harness**: la key está en `API_KEY` env var y opencode la consume.
+
+- **Free tier (5 modelos, tier 1)**: `opencode:deepseek-v4-flash-free`,
+  `opencode:north-mini-code-free`, `opencode:mimo-v2.5-free`, `opencode:big-pickle`,
+  `opencode:nemotron-3-ultra-free`. Respuesta 4-24s en test real. Ideales para
+  filtros: gratis y rápidos, dan diversidad de familia.
+- **Pro tier (8 modelos, tier 2/3/4)**: `opencode-go:kimi-k2.7-code` (Moonshot
+  Kimi, especializado en código), `opencode-go:deepseek-v4-pro` (razonador
+  fuerte), `opencode-go:glm-5.2` (Z.ai 1M context), `opencode-go:qwen3.7-max`
+  (Alibaba top de gama). Calidad/precio competitivas vs Sonnet/Opus.
+
+Total pool: **38 modelos** (1 local GPU + 1 local CPU + 11 filtro + 8 juez +
+8 fixer + 7 árbitro + 1 Opus + 1 minimax-m3) — diversidad amplia para
+consenso, cadencia alta, coste dominado por local/free.
 
 ### Política Opus (v6)
 

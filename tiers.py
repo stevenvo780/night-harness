@@ -34,12 +34,12 @@ from typing import Literal, Optional
 
 # Roles:
 #   local       — Ollama / servidor local
-#   cloud_mini  — modelos cloud baratos y rápidos (Minimax, Haiku, Flash Lite)
-#   cloud_mid   — modelos cloud medios (Flash, Sonnet, Pro, Minimax-largo)
-#   cloud_big   — modelos cloud grandes (Pro-thinking, Opus, Ultra)
+#   cloud_mini  — modelos cloud baratos y rápidos (Minimax, Haiku, Flash Lite, opencode free)
+#   cloud_mid   — modelos cloud medios (Flash, Sonnet, Pro, opencode-go pro)
+#   cloud_big   — modelos cloud grandes (Pro-thinking, Opus, opencode-go max)
 #
 # Familias (para diversidad en consenso):
-#   qwen, minimax, gemini, claude, codex, local_qwen
+#   qwen, minimax, gemini, claude, codex, local_qwen, opencode, opencode_go
 # ---------------------------------------------------------------------------
 
 
@@ -65,17 +65,19 @@ class ModelSpec:
 # Tier 0 — Escáner (LOCAL, gratis, alta concurrencia).
 # Idea: el mayor número de hipótesis al menor coste, luego filtrar arriba.
 # Los locales son ILIMITADOS (no consumen quota cloud) — la máquina es potente,
-# quemamos GPU a full.
+# quemamos GPU/CPU a full.
 #
-# ESTRATEGIA DE VRAM (corregida jul-2026): SOLO el 30B GPU como hunter.
-# El 80B CPU (qwen3-coder-next:cpu) es DEMASIADO LENTO para hunters de
-# cadencia alta (30-120s por respuesta); lo reservamos para el árbitro (tier 4)
-# donde solo se invoca en casos raros. 1 solo modelo local = sin contención
-# Ollama entre modelos.
+# ESTRATEGIA (jul-2026, run real): 2 modelos locales en PARALELO sin contención:
+#   · LOCAL_GPU: 30B en RTX 5070 Ti (10.6GB VRAM, 1-3s por respuesta).
+#   · LOCAL_CPU: 80B CPU explícito (32 cores ociosos, 30-60s por respuesta).
+# Con 4 hunters 30B + 2 hunters 80B CPU = 6 hilos, sin contención entre
+# GPU y CPU. La CPU tiene load 22/32 (24% idle) y la GPU 14% util → hay
+# MUCHO margen para más cadencia.
 # ---------------------------------------------------------------------------
 
 TIER0_HUNTERS: tuple[ModelSpec, ...] = (
-    # LOCAL_GPU: 30B, ~10.9GB VRAM. Es el hunter principal (1-3s por respuesta).
+    # LOCAL_GPU: 30B, ~10.6GB VRAM. Hunter principal (1-3s por respuesta).
+    # Hunters con índice 0, 2, 4, 6 (pares) usan este.
     ModelSpec(
         id='ollama:qwen3-coder:30b',
         family='qwen',
@@ -84,10 +86,19 @@ TIER0_HUNTERS: tuple[ModelSpec, ...] = (
         context_window=32_000,
         strengths=('code', 'reasoning'),
     ),
+    # LOCAL_CPU: 80B CPU explícito, no consume VRAM, 30-60s por respuesta.
+    # Más razonador que el 30B. Hunters con índice 1, 3, 5, 7 (impares) usan este.
+    ModelSpec(
+        id='ollama:qwen3-coder-next:cpu',
+        family='qwen',
+        role='local',
+        relative_cost=3,
+        context_window=32_000,
+        strengths=('code', 'reasoning', 'long'),
+    ),
 )
 
-# Second opinion: el mismo 30B (consistente con la lección del post-mortem:
-# mismo modelo chico para evitar contención de memoria en Ollama).
+# Second opinion: el mismo 30B (consistente con la lección del post-mortem).
 TIER0_30B_OPINIONS: tuple[ModelSpec, ...] = (
     ModelSpec(
         id='ollama:qwen3-coder:30b',
@@ -169,6 +180,50 @@ TIER1_FILTERS: tuple[ModelSpec, ...] = (
         strengths=('code', 'fast', 'json'),
     ),
     # NOTA: gemini-2.5-flash está rate-limited (429). NO lo usamos en tier 1.
+
+    # OpenCode free tier (jul-2026, key opencode-go del usuario):
+    # 5 modelos FREE ideales para filtros. Sin coste (rate-limited por el servicio
+    # pero sin afectar quota del usuario). Respuesta en 4-24s en test real.
+    ModelSpec(
+        id='opencode:deepseek-v4-flash-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast', 'reasoning'),
+    ),
+    ModelSpec(
+        id='opencode:north-mini-code-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    ModelSpec(
+        id='opencode:mimo-v2.5-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    ModelSpec(
+        id='opencode:big-pickle',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'fast'),
+    ),
+    ModelSpec(
+        id='opencode:nemotron-3-ultra-free',
+        family='opencode',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=128_000,
+        strengths=('code', 'reasoning'),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -223,6 +278,35 @@ TIER2_JUDGES: tuple[ModelSpec, ...] = (
         relative_cost=5,
         context_window=200_000,
         strengths=('code', 'reasoning', 'json', 'long'),
+    ),
+    # OpenCode-Go PRO (jul-2026, key opencode-go del usuario):
+    # 3 modelos PRO para jueces. Calidad/precio competitivas vs Sonnet/Opus.
+    # kimi-k2.7-code: Moonshot Kimi especializado en código.
+    ModelSpec(
+        id='opencode-go:kimi-k2.7-code',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'reasoning', 'fix'),
+    ),
+    # deepseek-v4-pro: razonador fuerte (DeepSeek v4 Pro).
+    ModelSpec(
+        id='opencode-go:deepseek-v4-pro',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'reasoning', 'long'),
+    ),
+    # glm-5.2: Z.ai GLM 5.2, 1M context, ideal para codebases grandes.
+    ModelSpec(
+        id='opencode-go:glm-5.2',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=4,
+        context_window=1_000_000,
+        strengths=('code', 'reasoning', 'long'),
     ),
 )
 
@@ -279,6 +363,34 @@ TIER3_FIXERS: tuple[ModelSpec, ...] = (
         context_window=32_000,
         strengths=('code', 'fix', 'reasoning'),
     ),
+    # OpenCode-Go PRO: los MEJORES para generar fixes de código.
+    # qwen3.7-max: Alibaba Qwen 3.7 Max — top de gama, excelente en código.
+    ModelSpec(
+        id='opencode-go:qwen3.7-max',
+        family='opencode_go',
+        role='cloud_big',
+        relative_cost=5,
+        context_window=200_000,
+        strengths=('code', 'fix', 'reasoning', 'long'),
+    ),
+    # deepseek-v4-pro: razonador fuerte, excelente en código.
+    ModelSpec(
+        id='opencode-go:deepseek-v4-pro',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'fix', 'reasoning'),
+    ),
+    # kimi-k2.7-code: Moonshot Kimi Code — especializado en código.
+    ModelSpec(
+        id='opencode-go:kimi-k2.7-code',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'fix', 'reasoning'),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -290,15 +402,14 @@ TIER3_FIXERS: tuple[ModelSpec, ...] = (
 # ---------------------------------------------------------------------------
 
 TIER4_ARBITERS: tuple[ModelSpec, ...] = (
-    # El 80B CPU como primer árbitro local (no consume quota, pero es lento
-    # ~30-120s; se usa SOLO en tier 4 donde la frecuencia es rarísima).
+    # El 30B GPU como árbitro local (más rápido que el 80B CPU).
     ModelSpec(
-        id='ollama:qwen3-coder-next:cpu',
+        id='ollama:qwen3-coder:30b',
         family='qwen',
         role='local',
-        relative_cost=3,
+        relative_cost=2,
         context_window=32_000,
-        strengths=('code', 'reasoning', 'long'),
+        strengths=('code', 'reasoning'),
     ),
     ModelSpec(
         id='claude:claude-sonnet-4-5',
@@ -323,6 +434,34 @@ TIER4_ARBITERS: tuple[ModelSpec, ...] = (
         relative_cost=4,
         context_window=2_000_000,
         strengths=('code', 'reasoning', 'long'),
+    ),
+    # OpenCode-Go PRO como árbitros fuertes.
+    # qwen3.7-max: top de gama Alibaba.
+    ModelSpec(
+        id='opencode-go:qwen3.7-max',
+        family='opencode_go',
+        role='cloud_big',
+        relative_cost=5,
+        context_window=200_000,
+        strengths=('code', 'reasoning', 'long', 'fix'),
+    ),
+    # glm-5.2: Z.ai 1M context — útil para árbitro con codebase grande.
+    ModelSpec(
+        id='opencode-go:glm-5.2',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=4,
+        context_window=1_000_000,
+        strengths=('code', 'reasoning', 'long'),
+    ),
+    # kimi-k2.7-code: especializado en código.
+    ModelSpec(
+        id='opencode-go:kimi-k2.7-code',
+        family='opencode_go',
+        role='cloud_mid',
+        relative_cost=3,
+        context_window=200_000,
+        strengths=('code', 'reasoning', 'fix'),
     ),
 )
 
@@ -398,6 +537,10 @@ def resolve_command(spec: ModelSpec, prompt: str, system: str = '') -> list[str]
     if spec.id.startswith('minimax:'):
         # El harness opencode inyecta Minimax automáticamente. Devolvemos un marcador.
         return ['opencode', '--model', spec.id.split(':', 1)[1], prompt]
+    if spec.id.startswith('opencode:') or spec.id.startswith('opencode-go:'):
+        # OpenCode built-in providers (jul-2026, key opencode-go del usuario).
+        # Formato: `opencode run --model <provider>/<model> -` lee de stdin.
+        return ['opencode', 'run', '--model', spec.id, '-']
     if spec.id.startswith('gemini:'):
         return ['gemini', '-m', spec.id.split(':', 1)[1], '-p', prompt]
     if spec.id.startswith('claude:'):

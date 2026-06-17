@@ -1181,6 +1181,36 @@ def main() -> None:
     second_specs = quota.filter_tier(tiers.get_tier0_30b(), 'tier0') or list(tiers.TIER0_30B_OPINIONS)
     filter_specs = quota.filter_tier(tiers.get_tier1_filters(), 'tier1') or list(tiers.TIER1_FILTERS)
     judge_specs = quota.filter_tier(tiers.get_tier2_judges(), 'tier2')[:JUDGE_TOTAL] or list(tiers.TIER2_JUDGES[:JUDGE_TOTAL])
+
+    # Aplicar configuración de modelos desde la TUI (tecla M).
+    # El archivo /tmp/harness-models.json contiene qué modelos habilitó el usuario
+    # para cada tier. Si existe, filtra los tiers a SOLO esos modelos.
+    mcfg_path = '/tmp/harness-models.json'
+    if os.path.exists(mcfg_path):
+        try:
+            with open(mcfg_path) as f:
+                mcfg = json.load(f)
+            mcfg_t1 = set(mcfg.get('tier1_filters', []))
+            mcfg_t2 = set(mcfg.get('tier2_judges', []))
+            mcfg_t3 = set(mcfg.get('tier3_fixers', []))
+            mcfg_t4 = set(mcfg.get('tier4_arbiters', []))
+            if mcfg_t1:
+                filter_specs = [s for s in filter_specs if s.id in mcfg_t1]
+                if not filter_specs:
+                    filter_specs = [s for s in tiers.TIER1_FILTERS if s.id in mcfg_t1]
+            if mcfg_t2:
+                judge_specs = [s for s in judge_specs if s.id in mcfg_t2]
+                if not judge_specs:
+                    judge_specs = [s for s in tiers.TIER2_JUDGES if s.id in mcfg_t2]
+            if mcfg_t3:
+                fixers_preselect = mcfg_t3  # se usa en fixer_worker
+            if mcfg_t4:
+                arbiters_preselect = mcfg_t4  # se usa en tier 4
+            any_filtered = mcfg_t1 or mcfg_t2 or mcfg_t3 or mcfg_t4
+            if any_filtered:
+                log('  [main] Config de modelos aplicada desde TUI (/tmp/harness-models.json)')
+        except (json.JSONDecodeError, OSError):
+            pass
     log(f'  Hunter specs activos:  {[s.id for s in hunter_specs]}')
     log(f'  Second specs activos:  {[s.id for s in second_specs]}')
     log(f'  Filter specs activos:  {[s.id for s in filter_specs]}')

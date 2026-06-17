@@ -84,7 +84,7 @@ class E2EJourney:
 # glm-5.2 vía opencode-go: también 1M context, alternativa.
 ORCHESTRATOR_MODEL = os.environ.get(
     'LOOP_ORCHESTRATOR_MODEL',
-    'gemini:gemini-2.5-flash-lite',
+    'opencode-go:glm-5.2',  # 1M ctx, fiable con JSON, vía opencode CLI
 )
 
 # Cuánto contexto del proyecto pasar al modelo (en líneas).
@@ -258,59 +258,27 @@ def build_project_snapshot(worktree: str, subdir: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-ORCHESTRATOR_SYSTEM = """Eres un orquestador de bug-hunting para una app SaaS de distribuidoras
-de alimentos (Next.js 15, Drizzle, Clerk auth). Tu trabajo es analizar el snapshot
-del proyecto y generar prompts DIRIGIDOS para cazadores de bugs automáticos.
+ORCHESTRATOR_SYSTEM = """Analiza el snapshot de la app y genera hunting_prompts (bugs específicos por archivo).
 
-El snapshot incluye:
-  · Rutas (page.tsx) — cada una es un módulo del dashboard
-  · Server Actions — funciones que mutan datos (pedidos, cobros, despachos, etc.)
-  · Schema Drizzle — tablas, enums, relaciones
-  · Máquina de estados — ciclo de vida del pedido (recibido→aceptado→en_cola→...→entregado)
-  · Auth — roles (admin, gerente, vendedor, bodeguero) y guards (requireRole)
+Formato JSON EXACTO (sin markdown, solo JSON):
+{
+  "hunting_prompts": [
+    {"file": "ruta/archivo.ts", "line": 42, "reason": "bug específico de dominio a revisar"}
+  ],
+  "e2e_journeys": [
+    {"name": "nombre del flujo", "module": "modulo", "steps": ["paso1", "paso2"], "expected": "resultado esperado"}
+  ]
+}
 
-DEBES generar 3 tipos de output en JSON:
+CLAVES de bug-hunting:
+- Auth: ¿cada server action tiene requireRole/requirePermission?
+- Tenant: ¿cada query filtra por tenantId?
+- Estados: ¿transiciones ilegales en la máquina de estados de pedidos?
+- Validación: ¿formularios zod? ¿montos negativos? ¿stock negativo?
+- Dinero: ¿cobros exceden saldo? ¿descuentos aplican correctamente?
+- Carrera: ¿operaciones no atómicas en stock/cartera?
 
-1. "hunting_prompts": lista de prompts dirigidos. Cada uno debe apuntar a UN archivo
-   o ruta específica y contener una PREGUNTA DE DOMINIO (no genérica).
-   Ejemplos:
-     · "En la máquina de estados, ¿la transición de 'en_cola' a 'despachado' sin pasar
-        por 'enrutado' está bloqueada? Revisa estado.ts línea 120."
-     · "En el form de cobros, ¿valida que el monto no exceda el saldo pendiente?
-        Revisa cobros/actions.ts."
-     · "En la ruta de despacho/recibidos, ¿la query filtra por tenantId?
-        Revisa page.tsx línea 45."
-     · "¿El server action de crear pedido verifica que el cliente exista y esté activo?
-        Revisa pedidos/nuevo/actions.ts."
-
-2. "domain_map": resumen estructurado del dominio encontrado:
-     · modules: lista de módulos (ej. ['despacho','pedidos','cartera','caja'])
-     · state_machines: { 'pedido': ['recibido','aceptado','en_cola',...] }
-     · auth_checks: patrones de auth encontrados (ej. ['requireRole','requirePermission'])
-     · risky_routes: rutas que tocan dinero/stock/auth
-     · relations: relaciones entre entidades
-
-3. "e2e_journeys": recorridos E2E complejos multi-step. Cada journey tiene:
-     · name: nombre descriptivo
-     · module: módulo al que pertenece
-     · steps: lista de pasos concretos (acciones de usuario)
-     · expected: resultado esperado
-   Ejemplo:
-     { "name": "Flujo completo pedido→despacho",
-       "module": "despacho",
-       "steps": [
-         "1. Login como vendedor",
-         "2. Ir a /pedidos/nuevo/pos",
-         "3. Seleccionar cliente con saldo pendiente",
-         "4. Agregar 3 productos con cantidades > stock",
-         "5. Ir a pago y seleccionar 'crédito'",
-         "6. Confirmar pedido"
-       ],
-       "expected": "El sistema debe mostrar error de stock insuficiente ANTES de crear el pedido"
-     }
-
-Genera AL MENOS 15 hunting_prompts y AL MENOS 5 e2e_journeys.
-Responde SOLO con JSON válido (sin markdown, sin explicación)."""
+Genera 15 hunting_prompts y 5 e2e_journeys."""
 
 
 def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
@@ -321,7 +289,7 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
     # Determinar el comando según el modelo.
     if ORCHESTRATOR_MODEL.startswith('gemini:'):
         model_name = ORCHESTRATOR_MODEL.split(':', 1)[1]
-        # gemini CLI lee de stdin? No, usa -p.
+        # gemini CLI con --output-format json devuelve {session_id, response, stats}.
         cmd = ['gemini', '-m', model_name, '-p', snapshot, '--output-format', 'json']
         try:
             result = subprocess.run(
@@ -330,17 +298,21 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
                 text=True,
                 timeout=timeout,
             )
-            text = result.stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            outer = json.loads(result.stdout.strip())
+            text = outer.get('response', '')
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             print(f'  [orch] gemini CLI falló: {e}')
             return None
     elif ORCHESTRATOR_MODEL.startswith('opencode'):
-        # opencode run --model <id> lee de stdin.
+        # opencode run lee de stdin (--model <id> -). Evitamos pasar el prompt
+        # como argumento CLI porque el snapshot es grande (~23K chars).
         model_id = ORCHESTRATOR_MODEL.replace(':', '/', 1)
-        prompt = f'<<SYS>>\n{ORCHESTRATOR_SYSTEM}\n<</SYS>>\n\n{snapshot}'
+        system_prompt = ORCHESTRATOR_SYSTEM.replace('"', '\\"')
+        stdin_input = f'<<SYS>>\n{system_prompt}\n<</SYS>>\n\n{snapshot}'
         try:
             result = subprocess.run(
-                ['opencode', 'run', '--model', model_id, prompt],
+                ['opencode', 'run', '--model', model_id, '-'],
+                input=stdin_input,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -355,24 +327,7 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
             print(f'  [orch] opencode CLI falló: {e}')
             return None
     else:
-        # Para otros modelos, usar opencode run genérico.
-        model_id = ORCHESTRATOR_MODEL.replace(':', '/', 1)
-        prompt = f'<<SYS>>\n{ORCHESTRATOR_SYSTEM}\n<</SYS>>\n\n{snapshot}'
-        try:
-            result = subprocess.run(
-                ['opencode', 'run', '--model', model_id, prompt],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            text = result.stdout.strip()
-            text = '\n'.join(
-                l for l in text.split('\n')
-                if not l.startswith('[0m') and 'build ·' not in l
-            ).strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            print(f'  [orch] modelo falló: {e}')
-            return None
+        return None
 
     # Parsear JSON del output.
     try:

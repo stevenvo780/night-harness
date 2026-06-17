@@ -16,6 +16,7 @@ Teclas:
   p / P    pausar/reanudar auto-refresh
   c / C    limpiar el log mostrado
   l / L    cambiar layout (compact/full/metrics-only)
+  m / M    configurar modelos por tier
   s / S    lanzar / detener ciclo del harness
   d / D    cambiar duración del ciclo (1h/2h/4h/8h/indefinido)
   ?        ayuda
@@ -40,6 +41,7 @@ from datetime import datetime
 STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else '/tmp/loop-v6-status.json'
 LOG_FILE = sys.argv[2] if len(sys.argv) > 2 else '/tmp/loop-v6.log'
 HARNESS_PID_FILE = '/tmp/loop-v6.pid'
+MODELS_CONFIG_FILE = '/tmp/harness-models.json'
 OLLAMA_URL = 'http://host.docker.internal:11434'
 
 REFRESH_SEC = 2.0
@@ -343,8 +345,143 @@ def check_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Configuración de modelos por tier (tecla M en la TUI)
+# ---------------------------------------------------------------------------
+
+def _load_model_config(path: str) -> dict:
+    """Carga la config de modelos desde JSON. Si no existe, usa defaults."""
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return _default_model_config()
+
+
+def _save_model_config(path: str, config: dict) -> None:
+    """Guarda la config de modelos a JSON."""
+    try:
+        with open(path, 'w') as f:
+            json.dump(config, f, indent=2)
+    except OSError:
+        pass
+
+
+def _default_model_config() -> dict:
+    """Config por defecto: todos los modelos habilitados."""
+    try:
+        # Importamos tiers.py si está disponible.
+        import tiers
+        return {
+            'tier1_filters': [s.id for s in tiers.TIER1_FILTERS],
+            'tier2_judges': [s.id for s in tiers.TIER2_JUDGES],
+            'tier3_fixers': [s.id for s in tiers.TIER3_FIXERS],
+            'tier4_arbiters': [s.id for s in tiers.TIER4_ARBITERS],
+        }
+    except ImportError:
+        return {
+            'tier1_filters': [],
+            'tier2_judges': [],
+            'tier3_fixers': [],
+            'tier4_arbiters': [],
+        }
+
+
+def _show_model_config(stdscr, config: dict) -> dict:
+    """Pantalla de selección de modelos por tier. Devuelve la nueva config."""
+    h, w = stdscr.getmaxyx()
+    tiers_list = [
+        ('Tier 1 · Filtros', 'tier1_filters', 'Refutan ruido (baratos)'),
+        ('Tier 2 · Jueces', 'tier2_judges', 'Confirman bugs (medios)'),
+        ('Tier 3 · Fixers', 'tier3_fixers', 'Generan fixes (fuertes)'),
+        ('Tier 4 · Árbitros', 'tier4_arbiters', 'Veredicto final (riesgosos)'),
+    ]
+    # Construir lista plana de (tier_label, tier_key, model_id, enabled)
+    items: list[tuple[str, str, str, bool]] = []
+    for tlabel, tkey, tdesc in tiers_list:
+        all_models = _default_model_config()[tkey]  # todos los disponibles
+        selected = set(config.get(tkey, []))
+        items.append(('HEADER', tkey, f'{tlabel} — {tdesc} ({len(selected)}/{len(all_models)})', False))
+        for mid in all_models:
+            items.append(('MODEL', tkey, mid, mid in selected))
+
+    sel = 0
+    scroll = 0
+    visible = h - 4  # espacio para header + footer
+    while True:
+        stdscr.erase()
+        # Header.
+        header = 'CONFIGURACIÓN DE MODELOS POR TIER'
+        stdscr.addstr(0, max(1, (w - len(header)) // 2), header,
+                      curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
+        # Items.
+        for i in range(scroll, min(len(items), scroll + visible)):
+            vi = i - scroll + 2  # dejar 2 líneas para header
+            ttype, _, label, enabled = items[i]
+            checkbox = ' [✓]' if enabled else ' [ ]'
+            prefix = '▸' if i == sel else ' '
+            attr = curses.color_pair(COLOR_PAIR_DEFAULT)
+            if i == sel:
+                attr |= curses.A_REVERSE
+            if ttype == 'HEADER':
+                attr |= curses.A_BOLD
+                prefix = '▾' if i == sel else ' '
+                checkbox = ''
+            line = f' {prefix}{checkbox} {label}'[:w - 2]
+            stdscr.addstr(vi, 1, line, attr)
+        # Footer.
+        footer = ('ESPACIO: toggle  ENTER: guardar  ESC: cancelar  '
+                  '↑/↓: mover  A: todos  N: ninguno')
+        stdscr.addstr(h - 1, 1, footer[:w - 2],
+                      curses.color_pair(COLOR_PAIR_DEFAULT) | curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:  # ESC
+            return config
+        elif key in (ord('\n'), ord('\r'), curses.KEY_ENTER):
+            # Guardar: reconstruir config desde items.
+            new_config = {}
+            for tlabel, tkey, _ in tiers_list:
+                new_config[tkey] = [mid for ttype, mk, mid, en in items
+                                     if ttype == 'MODEL' and mk == tkey and en]
+            _save_model_config(MODELS_CONFIG_FILE, new_config)
+            return new_config
+        elif key == curses.KEY_UP:
+            sel = (sel - 1) % len(items)
+            if sel < scroll:
+                scroll = sel
+        elif key == curses.KEY_DOWN:
+            sel = (sel + 1) % len(items)
+            if sel >= scroll + visible:
+                scroll = sel - visible + 1
+        elif key == ord(' '):
+            ttype, tkey, mid, enabled = items[sel]
+            if ttype == 'MODEL':
+                items[sel] = ('MODEL', tkey, mid, not enabled)
+            elif ttype == 'HEADER':
+                # Toggle todos los modelos del tier.
+                new_en = not any(en for tt, tk, _, en in items
+                                 if tt == 'MODEL' and tk == tkey)
+                for j, (tt, tk, m, _) in enumerate(items):
+                    if tt == 'MODEL' and tk == tkey:
+                        items[j] = ('MODEL', tkey, m, new_en)
+        elif key in (ord('a'), ord('A')):
+            # Enable all.
+            for j in range(len(items)):
+                if items[j][0] == 'MODEL':
+                    items[j] = ('MODEL', items[j][1], items[j][2], True)
+        elif key in (ord('n'), ord('N')):
+            # Disable all.
+            for j in range(len(items)):
+                if items[j][0] == 'MODEL':
+                    items[j] = ('MODEL', items[j][1], items[j][2], False)
 
 
 def draw_header(stdscr, status: dict, harness_alive: bool, y: int = 0) -> int:
@@ -567,6 +704,7 @@ def main(stdscr):
     layout = 'full'  # 'full' | 'compact' | 'metrics'
     cycle_duration = int(os.environ.get('LOOP_HOURS', '8'))  # horas del ciclo
     cycle_launched = False  # true cuando lanzamos un ciclo desde la TUI
+    model_config = _load_model_config(MODELS_CONFIG_FILE)
 
     # --- helpers TUI ---
     def _stop_harness():
@@ -669,6 +807,7 @@ def main(stdscr):
                 "  p / P     pausar / reanudar auto-refresh",
                 "  c / C     limpiar log mostrado",
                 "  l / L     cambiar layout (full / compact / metrics)",
+                "  m / M     configurar modelos por tier",
                 "  s / S     lanzar / detener ciclo del harness",
                 "  d / D     cambiar duración del ciclo",
                 f"            → actual: {cycle_duration}h {'(indefinido)' if cycle_duration == 0 else ''}",
@@ -705,6 +844,14 @@ def main(stdscr):
             curses.curs_set(0)
             log.lines.append(f'[TUI] duración del ciclo: {cycle_duration}h '
                              f'{"(indefinido)" if cycle_duration == 0 else ""}')
+            stdscr.clear()
+            last_refresh = 0
+        elif key in (ord('m'), ord('M')):
+            # Configuración de modelos por tier.
+            curses.curs_set(0)
+            model_config = _show_model_config(stdscr, model_config)
+            log.lines.append('[TUI] configuración de modelos actualizada. '
+                             'Reinicia el harness para aplicar (tecla S).')
             stdscr.clear()
             last_refresh = 0
 

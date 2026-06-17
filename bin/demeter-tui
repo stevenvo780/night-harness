@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# demeter-tui — wrapper para la TUI del harness v6
+# Compila un binario standalone (sin Python en runtime) en /usr/local/lib/demeter-tui/
+# y valida dependencias externas (opencode CLI, status files).
+#
+# Instalado: /usr/local/bin/demeter-tui (este script)
+# Binario:   /usr/local/lib/demeter-tui/demeter-tui-bin (PyInstaller --onefile)
+set -euo pipefail
+
+HARNESS_DIR="${HARNESS_DIR:-/workspace/night-harness}"
+BIN="/usr/local/lib/demeter-tui/demeter-tui-bin"
+AI_USAGE_DIR="${AI_USAGE_DIR:-/workspace/ai-usage-live}"
+STATUS_FILE="${STATUS_FILE:-/tmp/loop-v6-status.json}"
+PID_FILE="${PID_FILE:-/tmp/loop-v6.pid}"
+
+# --- Sub-comandos ---
+case "${1:-run}" in
+    -h|--help|help)
+        cat <<EOF
+demeter-tui — TUI del harness v6 (Deméter)
+
+Uso:
+  demeter-tui                  Lanza la TUI (requiere TTY)
+  demeter-tui check            Valida deps + binario (sin lanzar)
+  demeter-tui status           Muestra estado del harness v6 desde \$STATUS_FILE
+  demeter-tui path             Imprime path del binario
+  demeter-tui version          Versión del wrapper + binario
+  demeter-tui --help           Esta ayuda
+
+Variables de entorno (opcionales):
+  HARNESS_DIR    Dir del harness (default: /workspace/night-harness)
+  AI_USAGE_DIR   Dir de ai-usage-live (default: /workspace/ai-usage-live)
+  STATUS_FILE    Path al status JSON (default: /tmp/loop-v6-status.json)
+  PID_FILE       Path al PID file (default: /tmp/loop-v6.pid)
+EOF
+        exit 0
+        ;;
+    path)
+        echo "$BIN"
+        exit 0
+        ;;
+    version)
+        echo "wrapper: demeter-tui 1.0.0 (jul-2026)"
+        echo "binario: $BIN"
+        if [ -x "$BIN" ]; then
+            echo "binario OK ($(stat -c %s "$BIN" 2>/dev/null || stat -f %z "$BIN" 2>/dev/null) bytes)"
+        else
+            echo "binario NO encontrado"
+        fi
+        exit 0
+        ;;
+    check)
+        echo "=== demeter-tui check ==="
+        echo
+        echo "[1/5] binario en $BIN"
+        if [ -x "$BIN" ]; then
+            echo "      OK ($(stat -c %s "$BIN" 2>/dev/null || stat -f %z "$BIN" 2>/dev/null) bytes)"
+        else
+            echo "      FALTA — reinstalar: sudo cp $HARNESS_DIR/dist/demeter-tui $BIN"
+            exit 1
+        fi
+        echo
+        echo "[2/5] opencode CLI (necesario para opencode/opencode-go providers)"
+        if command -v opencode >/dev/null 2>&1; then
+            echo "      OK: $(command -v opencode) ($(opencode --version 2>/dev/null | head -1 || echo '?') )"
+        else
+            echo "      AVISO: no encontrado. La TUI funciona pero no podrá llamar modelos opencode-go."
+        fi
+        echo
+        echo "[3/5] status file en $STATUS_FILE"
+        if [ -r "$STATUS_FILE" ]; then
+            echo "      OK: $(wc -c < "$STATUS_FILE") bytes, modificado $(stat -c %y "$STATUS_FILE" 2>/dev/null || stat -f "%Sm" "$STATUS_FILE" 2>/dev/null)"
+        else
+            echo "      AVISO: no existe. La TUI mostrará dashboard vacío (el harness v6 no está corriendo o no ha escrito status aún)."
+        fi
+        echo
+        echo "[4/5] pid file en $PID_FILE"
+        if [ -r "$PID_FILE" ]; then
+            PID_VAL=$(cat "$PID_FILE" 2>/dev/null || echo "?")
+            if [ "$PID_VAL" != "?" ] && kill -0 "$PID_VAL" 2>/dev/null; then
+                echo "      OK: harness v6 corriendo con PID $PID_VAL"
+            else
+                echo "      AVISO: pid file existe pero proceso $PID_VAL no responde."
+            fi
+        else
+            echo "      AVISO: no existe. La TUI asumirá que el harness no está corriendo."
+        fi
+        echo
+        echo "[5/5] AI_USAGE_DIR en $AI_USAGE_DIR"
+        if [ -d "$AI_USAGE_DIR" ]; then
+            echo "      OK: $(ls -1 "$AI_USAGE_DIR" | wc -l) archivos"
+        else
+            echo "      AVISO: no existe. La TUI no podrá mostrar cuotas cloud."
+        fi
+        echo
+        echo "Listo. Para lanzar: demeter-tui"
+        exit 0
+        ;;
+    status)
+        if [ -r "$STATUS_FILE" ]; then
+            cat "$STATUS_FILE" | python3 -m json.tool 2>/dev/null || cat "$STATUS_FILE"
+        else
+            echo "(status file no existe: $STATUS_FILE)"
+            exit 1
+        fi
+        exit 0
+        ;;
+esac
+
+# --- Comando por defecto: lanzar la TUI ---
+
+# Validar binario.
+if [ ! -x "$BIN" ]; then
+    echo "ERROR: binario no encontrado en $BIN" >&2
+    echo "       Reinstalar con: sudo cp $HARNESS_DIR/dist/demeter-tui $BIN" >&2
+    exit 1
+fi
+
+# Validar TTY.
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "ERROR: la TUI requiere un TTY real (no funciona redirigido)." >&2
+    echo "       Lánzala desde una terminal interactiva." >&2
+    exit 1
+fi
+
+# Setear TERM si no está.
+export TERM="${TERM:-xterm-256color}"
+
+# Setear env vars que el binario puede leer.
+export HARNESS_DIR AI_USAGE_DIR STATUS_FILE PID_FILE
+
+# Lanzar.
+exec "$BIN" "$@"

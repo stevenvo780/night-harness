@@ -2,6 +2,12 @@ __pycache__/
 *.pyc
 .DS_Store
 
+# PyInstaller artifacts (no commitear binarios compilados)
+build/
+dist/
+*.spec
+*.pkg
+
 # Keys / secrets — NUNCA commitear
 .env
 .env.local

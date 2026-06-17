@@ -8,6 +8,45 @@ de un modelo de pago.
 
 > Nace del proyecto **Deméter**. La config de `MODULES`/rutas es un ejemplo: adáptala a tu repo.
 
+## Instalación (Linux)
+
+La TUI se distribuye como **binario self-contained** (sin Python en runtime) +
+wrapper bash.
+
+```bash
+cd /workspace/night-harness
+bash install.sh
+```
+
+`install.sh` hace 4 pasos:
+1. Instala PyInstaller (si falta) en el user.
+2. Compila `tui.py` → `dist/demeter-tui` con `--onefile` (incluye Python + libs).
+3. `sudo cp` del binario a `/usr/local/lib/demeter-tui/demeter-tui-bin`.
+4. `sudo cp` del wrapper a `/usr/local/bin/demeter-tui`.
+
+Al final ejecuta `demeter-tui check` para validar 5 dependencias:
+binario, `opencode` CLI, status file, harness v6 corriendo, `ai-usage-live/`.
+
+**Uso**:
+```bash
+demeter-tui              # lanza la TUI (requiere TTY real)
+demeter-tui check        # valida deps sin lanzar
+demeter-tui status       # muestra el JSON del status
+demeter-tui path         # imprime path del binario
+demeter-tui version      # versión wrapper + binario
+demeter-tui --help       # ayuda
+```
+
+**Sin dependencias de Python**: el binario (`/usr/local/lib/demeter-tui/demeter-tui-bin`,
+8.3MB) incluye el intérprete Python y todas las libs. `ldd` muestra solo libc/libz/libpthread
+(todas del sistema). Cualquier Linux x86_64 con kernel 3.2+ puede ejecutarlo.
+
+**Desinstalar**:
+```bash
+sudo rm /usr/local/bin/demeter-tui /usr/local/lib/demeter-tui/demeter-tui-bin
+sudo rmdir /usr/local/lib/demeter-tui
+```
+
 ---
 
 ## Idea central: los modelos CHICOS rinden con la ESTRUCTURA, no con tamaño

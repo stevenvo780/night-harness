@@ -64,19 +64,30 @@ class ModelSpec:
 # ---------------------------------------------------------------------------
 # Tier 0 — Escáner (LOCAL, gratis, alta concurrencia).
 # Idea: el mayor número de hipótesis al menor coste, luego filtrar arriba.
+# Los locales son ILIMITADOS (no consumen quota cloud) — la máquina es potente,
+# quemamos GPU a full.
+#
+# ESTRATEGIA DE VRAM (corregida jul-2026): SOLO el 30B GPU como hunter.
+# El 80B CPU (qwen3-coder-next:cpu) es DEMASIADO LENTO para hunters de
+# cadencia alta (30-120s por respuesta); lo reservamos para el árbitro (tier 4)
+# donde solo se invoca en casos raros. 1 solo modelo local = sin contención
+# Ollama entre modelos.
 # ---------------------------------------------------------------------------
 
 TIER0_HUNTERS: tuple[ModelSpec, ...] = (
+    # LOCAL_GPU: 30B, ~10.9GB VRAM. Es el hunter principal (1-3s por respuesta).
     ModelSpec(
-        id='ollama:qwen3.5:9b',
+        id='ollama:qwen3-coder:30b',
         family='qwen',
         role='local',
-        relative_cost=1,
+        relative_cost=2,
         context_window=32_000,
-        strengths=('code', 'fast'),
+        strengths=('code', 'reasoning'),
     ),
 )
 
+# Second opinion: el mismo 30B (consistente con la lección del post-mortem:
+# mismo modelo chico para evitar contención de memoria en Ollama).
 TIER0_30B_OPINIONS: tuple[ModelSpec, ...] = (
     ModelSpec(
         id='ollama:qwen3-coder:30b',
@@ -91,28 +102,46 @@ TIER0_30B_OPINIONS: tuple[ModelSpec, ...] = (
 # ---------------------------------------------------------------------------
 # Tier 1 — Filtro (CHICO CLOUD, alta cuota, media concurrencia).
 # Filtra las hipótesis del escáner local. Diversidad de familias = 합의 señal.
+# Maximizamos el paralelismo con VARIOS modelos cloud baratos en paralelo.
+# Modelos verificados que SÍ responden en este entorno:
+#   - minimax/MiniMax-M3 (alta cuota, 51M tokens/día)
+#   - minimax/MiniMax-M2.5-highspeed (chico, rápido)
+#   - minimax/MiniMax-M2.7-highspeed (chico, rápido)
+#   - gemini-2.5-flash-lite (alta cuota 95%, test OK)
+#   - gemini-3-flash-preview (preview, alta cuota)
+#   - claude-haiku-4-5 (tier bajo Anthropic)
 # ---------------------------------------------------------------------------
 
 TIER1_FILTERS: tuple[ModelSpec, ...] = (
-    # Minimax-M3 (yo) primero: alta cuota, bueno, barato, integrado.
+    # Minimax-M3 (yo) primero: alta cuota, barato, capaz.
     ModelSpec(
-        id='minimax:MiniMax-M3',
+        id='minimax/MiniMax-M3',
         family='minimax',
         role='cloud_mini',
         relative_cost=2,
         context_window=1_000_000,
         strengths=('code', 'reasoning', 'long', 'json'),
     ),
-    # Gemini 2.5 Flash: alta cuota, rápido.
+    # Minimax chiquito y rápido (alternativa al M3).
     ModelSpec(
-        id='gemini:gemini-2.5-flash',
-        family='gemini',
+        id='minimax/MiniMax-M2.7-highspeed',
+        family='minimax',
         role='cloud_mini',
-        relative_cost=2,
+        relative_cost=1,
         context_window=1_000_000,
-        strengths=('code', 'fast', 'json', 'long'),
+        strengths=('code', 'fast'),
     ),
-    # Gemini 2.5 Flash Lite: aún más barato, más cuota.
+    # Minimax M2.5 highspeed (más estable que M2.7).
+    ModelSpec(
+        id='minimax/MiniMax-M2.5-highspeed',
+        family='minimax',
+        role='cloud_mini',
+        relative_cost=1,
+        context_window=1_000_000,
+        strengths=('code', 'fast'),
+    ),
+    # Gemini 2.5 Flash Lite: confirmado que funciona (test OK con --yolo --output-format text).
+    # Tier 1 PRINCIPAL gemini: alta cuota (95% diaria), rápido, barato.
     ModelSpec(
         id='gemini:gemini-2.5-flash-lite',
         family='gemini',
@@ -120,6 +149,15 @@ TIER1_FILTERS: tuple[ModelSpec, ...] = (
         relative_cost=1,
         context_window=1_000_000,
         strengths=('code', 'fast', 'json'),
+    ),
+    # Gemini 3 Flash Preview: nueva versión, probablemente más cuota.
+    ModelSpec(
+        id='gemini:gemini-3-flash-preview',
+        family='gemini',
+        role='cloud_mini',
+        relative_cost=2,
+        context_window=1_000_000,
+        strengths=('code', 'fast', 'json', 'long'),
     ),
     # Claude Haiku: tier bajo de Anthropic.
     ModelSpec(
@@ -130,31 +168,24 @@ TIER1_FILTERS: tuple[ModelSpec, ...] = (
         context_window=200_000,
         strengths=('code', 'fast', 'json'),
     ),
+    # NOTA: gemini-2.5-flash está rate-limited (429). NO lo usamos en tier 1.
 )
 
 # ---------------------------------------------------------------------------
 # Tier 2 — Jueces (MEDIO FUERTE, baja frecuencia).
 # REAL vs NOT_A_BUG. Quorum 2/3 o 2/4 según cuántos respondan.
+# Modelos verificados: minimax (OK), gemini-2.5-pro (asumido), sonnet (OK).
 # ---------------------------------------------------------------------------
 
 TIER2_JUDGES: tuple[ModelSpec, ...] = (
     # Minimax-M3 primero (barato, capaz, alta cuota).
     ModelSpec(
-        id='minimax:MiniMax-M3',
+        id='minimax/MiniMax-M3',
         family='minimax',
         role='cloud_mid',
         relative_cost=2,
         context_window=1_000_000,
         strengths=('code', 'reasoning', 'long', 'json'),
-    ),
-    # Codex (OpenAI): muy bueno para código, cadencia rápida.
-    ModelSpec(
-        id='codex:gpt-5-codex',
-        family='codex',
-        role='cloud_mid',
-        relative_cost=4,
-        context_window=400_000,
-        strengths=('code', 'fix', 'reasoning'),
     ),
     # Gemini 2.5 Pro: buen razonador.
     ModelSpec(
@@ -165,10 +196,28 @@ TIER2_JUDGES: tuple[ModelSpec, ...] = (
         context_window=2_000_000,
         strengths=('code', 'reasoning', 'long'),
     ),
-    # Claude Sonnet 4.6: el "default" para código sólido. ÚLTIMO en el juez
-    # para preservar su cuota semanal (es el más caro y el más limitado).
+    # Gemini 3 Pro Preview: tier más nuevo, más razonador.
     ModelSpec(
-        id='claude:claude-sonnet-4-6',
+        id='gemini:gemini-3-pro-preview',
+        family='gemini',
+        role='cloud_mid',
+        relative_cost=4,
+        context_window=2_000_000,
+        strengths=('code', 'reasoning', 'long'),
+    ),
+    # Codex (OpenAI): muy bueno para código, cadencia rápida.
+    # Verificado: `codex exec` con default `gpt-5.5` funciona. `codex-mini` NO soportado.
+    ModelSpec(
+        id='codex:gpt-5.5',
+        family='codex',
+        role='cloud_mid',
+        relative_cost=4,
+        context_window=400_000,
+        strengths=('code', 'fix', 'reasoning'),
+    ),
+    # Claude Sonnet: ÚLTIMO en el juez para preservar su cuota semanal.
+    ModelSpec(
+        id='claude:claude-sonnet-4-5',
         family='claude',
         role='cloud_mid',
         relative_cost=5,
@@ -185,22 +234,25 @@ TIER2_JUDGES: tuple[ModelSpec, ...] = (
 # ---------------------------------------------------------------------------
 
 TIER3_FIXERS: tuple[ModelSpec, ...] = (
+    # Codex primero: muy bueno generando fixes de código.
     ModelSpec(
-        id='codex:gpt-5-codex',
+        id='codex:gpt-5.5',
         family='codex',
         role='cloud_mid',
         relative_cost=4,
         context_window=400_000,
         strengths=('code', 'fix', 'reasoning'),
     ),
+    # Minimax-M3 segundo: barato, capaz, alta cuota.
     ModelSpec(
-        id='minimax:MiniMax-M3',
+        id='minimax/MiniMax-M3',
         family='minimax',
         role='cloud_mid',
         relative_cost=2,
         context_window=1_000_000,
         strengths=('code', 'fix', 'reasoning', 'long'),
     ),
+    # Gemini 2.5 Pro.
     ModelSpec(
         id='gemini:gemini-2.5-pro',
         family='gemini',
@@ -209,15 +261,16 @@ TIER3_FIXERS: tuple[ModelSpec, ...] = (
         context_window=2_000_000,
         strengths=('code', 'fix', 'long'),
     ),
+    # Claude Sonnet.
     ModelSpec(
-        id='claude:claude-sonnet-4-6',
+        id='claude:claude-sonnet-4-5',
         family='claude',
         role='cloud_mid',
         relative_cost=5,
         context_window=200_000,
         strengths=('code', 'fix', 'reasoning'),
     ),
-    # Local 30b como último recurso (gratis; requiere OLLAMA_MAX_LOADED_MODELS>=2).
+    # Local 30b como último recurso (gratis, sin contención con 9b).
     ModelSpec(
         id='ollama:qwen3-coder:30b',
         family='local_qwen',
@@ -237,8 +290,18 @@ TIER3_FIXERS: tuple[ModelSpec, ...] = (
 # ---------------------------------------------------------------------------
 
 TIER4_ARBITERS: tuple[ModelSpec, ...] = (
+    # El 80B CPU como primer árbitro local (no consume quota, pero es lento
+    # ~30-120s; se usa SOLO en tier 4 donde la frecuencia es rarísima).
     ModelSpec(
-        id='claude:claude-sonnet-4-6',
+        id='ollama:qwen3-coder-next:cpu',
+        family='qwen',
+        role='local',
+        relative_cost=3,
+        context_window=32_000,
+        strengths=('code', 'reasoning', 'long'),
+    ),
+    ModelSpec(
+        id='claude:claude-sonnet-4-5',
         family='claude',
         role='cloud_mid',
         relative_cost=5,
@@ -246,7 +309,7 @@ TIER4_ARBITERS: tuple[ModelSpec, ...] = (
         strengths=('code', 'reasoning', 'json'),
     ),
     ModelSpec(
-        id='minimax:MiniMax-M3',
+        id='minimax/MiniMax-M3',
         family='minimax',
         role='cloud_mid',
         relative_cost=2,

@@ -44,13 +44,15 @@ AI_USAGE_DIR = Path(os.environ.get(
 
 # Límites por familia. Si el plan real difiere, sobreescribir vía env.
 DEFAULT_LIMITS = {
-    'claude-sonnet-4-6': {'weekly_pct_max': 80.0, 'session_pct_max': 60.0},
+    'claude-sonnet-4-5': {'weekly_pct_max': 80.0, 'session_pct_max': 60.0},
     'claude-opus-4-6':   {'weekly_pct_max': 95.0, 'session_pct_max': 80.0},
     'claude-haiku-4-5':  {'weekly_pct_max': 90.0, 'session_pct_max': 70.0},
-    'gpt-5-codex':       {'daily_pct_max': 85.0, 'session_pct_max': 70.0},
+    'codex-mini':        {'daily_pct_max': 85.0, 'session_pct_max': 70.0},
     'gemini-2.5-pro':    {'daily_pct_max': 85.0, 'session_pct_max': 70.0},
     'gemini-2.5-flash':  {'daily_pct_max': 90.0, 'session_pct_max': 75.0},
     'gemini-2.5-flash-lite': {'daily_pct_max': 95.0, 'session_pct_max': 80.0},
+    'gemini-3-pro-preview':   {'daily_pct_max': 85.0, 'session_pct_max': 70.0},
+    'gemini-3-flash-preview': {'daily_pct_max': 95.0, 'session_pct_max': 80.0},
     # Minimax-M3: sin límite explícito en el dashboard; siempre OK.
 }
 
@@ -206,8 +208,17 @@ def get_limit(model_id: str, period: str) -> Optional[float]:
 def is_model_ok(model_id: str) -> bool:
     """True si el modelo está por debajo del límite (puede usarse).
 
-    Sin datos → True (deja pasar; el caller decide si gastar).
+    REGLAS:
+      · Modelos locales (`ollama:*`): SIEMPRE OK — son ILIMITADOS (no consumen
+        quota cloud, la máquina es local y potente). Aprovechamos el paralelismo
+        al máximo.
+      · Sin datos del cloud → True (deja pasar; el caller decide si gastar).
+      · Con datos del cloud → comparar contra DEFAULT_LIMITS.
     """
+    # Local: infinito. No se consulta quota, no se registra en call_log.
+    if model_id.startswith('ollama:'):
+        return True
+
     state = refresh()
     normalized = _normalize_model_name(model_id)
     info = state.by_model_pct.get(normalized, {})
@@ -218,21 +229,18 @@ def is_model_ok(model_id: str) -> bool:
         limit = get_limit(normalized, period)
         if not limit:
             continue
-        # Si no tenemos pct real, estimamos: tokens_usados / límite_estimado
-        # (el dashboard no siempre expone pct; caemos a heurística).
-        # Por ahora, usamos los tokens: si el daily supera 80% del límite estimado
-        # (100M tokens/día como proxy), bloqueamos. Esto es aproximado.
         tokens = info.get(f'{period}_tokens', 0)
-        # 100M tokens/día como proxy de "1 plan completo usado" para Sonnet/Pro.
-        # Se sobreescribe con `ai-usage-quota edit` para precisión.
         proxy_limit = {
+            'claude-sonnet-4-5': 50_000_000,
             'claude-sonnet-4-6': 50_000_000,
             'claude-opus-4-6': 10_000_000,
             'claude-haiku-4-5': 100_000_000,
-            'gpt-5-codex': 30_000_000,
+            'codex-mini': 30_000_000,
             'gemini-2.5-pro': 50_000_000,
             'gemini-2.5-flash': 200_000_000,
             'gemini-2.5-flash-lite': 500_000_000,
+            'gemini-3-pro-preview': 50_000_000,
+            'gemini-3-flash-preview': 200_000_000,
         }.get(normalized, 50_000_000)
         pct = (tokens / proxy_limit) * 100
         if pct >= limit:

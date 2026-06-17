@@ -223,7 +223,7 @@ def call_model(spec: tiers.ModelSpec, system: str, prompt: str, max_tokens: int 
     try:
         if spec.id.startswith('ollama:'):
             text = _call_ollama(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('minimax:'):
+        elif spec.id.startswith('minimax/') or spec.id.startswith('minimax:'):
             text = _call_minimax(spec, prompt, system, max_tokens, timeout)
         elif spec.id.startswith('gemini:'):
             text = _call_gemini_cli(spec, prompt, system, max_tokens, timeout)
@@ -259,38 +259,54 @@ def _call_ollama(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: in
         'prompt': prompt,
         'system': system,
         'stream': False,
+        # `keep_alive: '10m'` evita que Ollama descargue el modelo entre requests.
+        # Crítico para cadencia alta: la primera carga tarda 2-3s; las siguientes <1s.
+        'keep_alive': os.environ.get('LOOP_OLLAMA_KEEP_ALIVE', '10m'),
         'options': {'num_predict': max_tokens, 'temperature': 0.2},
     }
+    # El 80B CPU puede tardar 60-180s en responder requests grandes; el 30B
+    # GPU <10s. Timeout por modelo: modelos CPU reciben timeout más alto.
+    is_cpu = 'cpu' in model_name.lower() or '80b' in model_name.lower() or 'next' in model_name.lower()
+    actual_timeout = timeout
+    if is_cpu:
+        # CPU es ~10-20x más lento que GPU. Estiramos el timeout.
+        actual_timeout = max(timeout, 300)  # mínimo 5min para CPU
     req = urllib.request.Request(
         f'{base}/api/generate',
         data=json.dumps(payload).encode(),
         headers={'Content-Type': 'application/json'},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=actual_timeout) as r:
         data = json.loads(r.read())
     return data.get('response', '').strip()
 
 
 def _call_minimax(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                  timeout: int) -> str:
-    """Invoca Minimax-M3 vía el CLI opencode. Si opencode no está en PATH,
-    intenta vía un script interno (puede ser un HTTP directo al API)."""
-    # Por ahora usamos el binario `opencode` con `--model <id>`.
-    # El harness opencode está disponible en este entorno.
-    model = spec.id.split(':', 1)[1]  # 'MiniMax-M3'
+    """Invoca Minimax vía el CLI opencode. Formato del id: 'minimax/MiniMax-M3'
+    (provider/model con slash). Si opencode no está en PATH, intenta HTTP
+    directo al API.
+    """
+    # El spec.id es 'minimax/MiniMax-M3' (formato opencode). Lo pasamos tal cual.
+    model_id = spec.id  # 'minimax/MiniMax-M3'
     full_prompt = (f'<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}' if system else prompt)
     try:
         result = subprocess.run(
-            ['opencode', 'run', '--model', model, full_prompt],
+            ['opencode', 'run', '--model', model_id, full_prompt],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        return result.stdout.strip()
+        out = result.stdout.strip()
+        if not out and result.stderr:
+            # opencode suele loguear el error a stderr; mostrarlo.
+            log(f'  [minimax] stderr: {result.stderr[:200]}')
+        return out
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f'  [minimax] CLI falló: {e}; probando HTTP directo')
         # Fallback: HTTP al API de Minimax (si hay MINIMAX_API_KEY en env).
-        return _call_minimax_http(model, full_prompt, max_tokens, timeout)
+        model_name = spec.id.split('/', 1)[-1]  # 'MiniMax-M3'
+        return _call_minimax_http(model_name, full_prompt, max_tokens, timeout)
 
 
 def _call_minimax_http(model: str, prompt: str, max_tokens: int, timeout: int) -> str:
@@ -336,15 +352,25 @@ def _call_claude_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens
 
 def _call_gemini_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                      timeout: int) -> str:
+    """Invoca Gemini CLI en modo headless. Flags verificados:
+    - `-m <model>`: modelo concreto (alias como 'flash' también funciona).
+    - `-p <prompt>`: modo headless.
+    - `--yolo`: auto-aprueba tools (necesario porque el CLI pregunta).
+    - `--output-format text`: salida limpia, sin JSON-RPC.
+    """
     model = spec.id.split(':', 1)[1]
     full_prompt = f'{system}\n\n{prompt}' if system else prompt
     try:
         result = subprocess.run(
-            ['gemini', '-m', model, '-p', full_prompt],
+            ['gemini', '-m', model, '-p', full_prompt,
+             '--yolo', '--output-format', 'text'],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        if result.returncode != 0 and '429' in (result.stderr or ''):
+            # Rate limit conocido: marcar para cuarentena.
+            log(f'  [gemini] {model} rate-limited (429)')
         return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f'  [gemini] CLI falló: {e}')
@@ -353,11 +379,17 @@ def _call_gemini_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens
 
 def _call_codex_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                     timeout: int) -> str:
-    model = spec.id.split(':', 1)[1]
+    """Invoca Codex CLI. Flags verificados:
+    - `codex exec <prompt>`: subcomando `exec` para no-interactive.
+    - `--model <model>`: modelo concreto (gpt-5.5 es el default; codex-mini NO soportado).
+    - `--skip-git-repo-check`: si el worktree tiene su propio git.
+    """
+    # Si el spec es `codex:gpt-5.5`, extraemos 'gpt-5.5'. Si no, default 'gpt-5.5'.
+    model = spec.id.split(':', 1)[1] if ':' in spec.id else 'gpt-5.5'
     full_prompt = f'{system}\n\n{prompt}' if system else prompt
     try:
         result = subprocess.run(
-            ['codex', '--model', model, full_prompt],
+            ['codex', 'exec', '--model', model, '--skip-git-repo-check', full_prompt],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -404,6 +436,67 @@ Si NO encuentras bugs en la zona, responde EXACTAMENTE: NO_BUGS
 """
 
 
+def _parse_bug_line(line: str) -> Optional[dict]:
+    """Extrae {file, line, snippet, why} de una línea de output del hunter.
+    Acepta varios formatos porque los modelos locales no siempre son estrictos.
+    Acepta paréntesis (rutas del App Router como `app/(panel)/...`).
+    """
+    # Patrón para el path: word chars, /, ., -, (, ).
+    PATH = r'[\w/.\-()]+'
+    # Formato 1: FILE::LINE::SNIPPET::REASON (estricto, el original).
+    m = re.match(
+        rf'^{PATH}\.([a-z]{{1,5}})::(\d+)::([^:]{{1,200}})::(.*)$',
+        line,
+    )
+    if m:
+        return {
+            'file': m.group(0).split('::')[0],
+            'line': int(m.group(2)),
+            'snippet': m.group(3).strip()[:200],
+            'why': m.group(4).strip()[:500],
+        }
+    # Formato 2: FILE:LINE - REASON (con guión).
+    m = re.match(
+        rf'^{PATH}\.([a-z]{{1,5}}):(\d+)\s*[-–—]\s*(.{{5,500}})$',
+        line,
+    )
+    if m:
+        text = m.group(3).strip()
+        return {
+            'file': m.group(0).split(':')[0].rstrip(),
+            'line': int(m.group(2)),
+            'snippet': text[:200],
+            'why': text[:500],
+        }
+    # Formato 3: - FILE:LINE: ... (markdown bullet, como a veces devuelve el 30b).
+    m = re.match(
+        rf'^[\s\-\*]*({PATH}\.[a-z]{{1,5}}):(\d+)[:\s]+(.{{5,500}})$',
+        line,
+    )
+    if m:
+        text = m.group(3).strip()
+        return {
+            'file': m.group(1),
+            'line': int(m.group(2)),
+            'snippet': text[:200],
+            'why': text[:500],
+        }
+    # Formato 4: `path/file.tsx:42` seguido de texto (sin separador).
+    m = re.match(
+        rf'^`?({PATH}\.[a-z]{{1,5}}):(\d+)`?\s*[:\s\-–]?\s*(.{{5,500}})$',
+        line,
+    )
+    if m:
+        text = m.group(3).strip()
+        return {
+            'file': m.group(1),
+            'line': int(m.group(2)),
+            'snippet': text[:200],
+            'why': text[:500],
+        }
+    return None
+
+
 def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int) -> None:
     """Un hilo del escáner. Procesa una zona y emite suspectq."""
     log(f'  [hunter-{wid}] {hunter_spec.id} arrancando ({len(zone_files)} archivos)')
@@ -423,24 +516,26 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int)
             prompt = (
                 f'Audita el archivo `{file}` (longitud {len(code)} chars).\n'
                 f'```typescript\n{code[:8000]}\n```\n'
-                'Reporta bugs en formato FILE::LINE::SNIPPET::REASON o NO_BUGS.'
+                'Reporta bugs en formato `path/file.tsx:LINE` seguido de la '
+                'descripción, uno por línea. Si no hay bugs: NO_BUGS.\n'
+                'Ejemplo: `lib/queries/foo.ts:42` - validacion zod faltante'
             )
             text = call_model(hunter_spec, HUNTER_SYSTEM, prompt, max_tokens=1500)
             if not text or 'NO_BUGS' in text:
                 continue
-            # Parsear el output. Cada línea que matchea el formato cuenta como 1 sample.
+            # Parsear con el parser flexible (4 formatos aceptados).
             for line in text.splitlines():
-                m = re.match(
-                    r'^([\w/.\-]+\.[a-z]+)::(\d+)::([^:]+)::(.*)$',
-                    line.strip(),
-                )
+                line = line.strip()
+                if not line or line.startswith('NO_BUGS') or line.startswith('#'):
+                    continue
+                m = _parse_bug_line(line)
                 if m:
                     yield_suspect(
                         Suspect(
-                            file=m.group(1),
-                            line=int(m.group(2)),
-                            snippet=m.group(3).strip(),
-                            why=m.group(4).strip(),
+                            file=m['file'],
+                            line=m['line'],
+                            snippet=m['snippet'],
+                            why=m['why'],
                             samples=1,
                             source='hunter',
                         )

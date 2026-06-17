@@ -62,33 +62,70 @@ COLOR_PAIR_HIGHLIGHT = 14
 
 def init_colors() -> bool:
     """Inicializa los pares de color. Retorna False si no se pudo (terminal
-    sin soporte de color)."""
+    sin soporte de color). Funciona con terminales de 8, 16, o 256 colores."""
     try:
         curses.start_color()
         curses.use_default_colors()
-    except curses.error:
+    except (curses.error, Exception):
         return False
+
+    # Detectar cuántos colores soporta la terminal.
+    # Típicos: 8 (básica), 16, 88, 256 (xterm-256color).
+    n_colors = curses.COLORS
+    n_pairs = curses.COLOR_PAIRS
+
+    # Si la terminal tiene menos de 16 colores, limitamos a los 8 básicos
+    # y evitamos grises/colores extendidos.
+    limited = n_colors < 16
+
+    # Helper: en lugar de pasar el número de color "gris" (que no existe en
+    # terminales de 8 colores), usamos WHITE con A_DIM. Esto lo aplicamos
+    # en draw_*_panel cuando queremos "gris".
+    # Aquí simplemente NO creamos el par GRAY si la terminal es limited;
+    # los callers usan curses.A_DIM directamente.
+
     pairs = [
-        (COLOR_PAIR_DEFAULT, -1, -1),
-        (COLOR_PAIR_HEADER, curses.COLOR_CYAN, -1),
-        (COLOR_PAIR_GREEN, curses.COLOR_GREEN, -1),
-        (COLOR_PAIR_YELLOW, curses.COLOR_YELLOW, -1),
-        (COLOR_PAIR_RED, curses.COLOR_RED, -1),
-        (COLOR_PAIR_CYAN, curses.COLOR_CYAN, -1),
-        (COLOR_PAIR_MAGENTA, curses.COLOR_MAGENTA, -1),
-        (COLOR_PAIR_BLUE, curses.COLOR_BLUE, -1),
-        (COLOR_PAIR_GRAY, 8, -1),
-        (COLOR_PAIR_LOCAL, curses.COLOR_CYAN, -1),
-        (COLOR_PAIR_CLOUD, curses.COLOR_MAGENTA, -1),
-        (COLOR_PAIR_BAR, 8, -1),
-        (COLOR_PAIR_BAR_FULL, curses.COLOR_GREEN, -1),
-        (COLOR_PAIR_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN),
+        # (pair_id, fg, bg, atributos_extra)
+        (COLOR_PAIR_DEFAULT, -1, -1, 0),
+        (COLOR_PAIR_HEADER, curses.COLOR_CYAN, -1, 0),
+        (COLOR_PAIR_GREEN, curses.COLOR_GREEN, -1, 0),
+        (COLOR_PAIR_YELLOW, curses.COLOR_YELLOW, -1, 0),
+        (COLOR_PAIR_RED, curses.COLOR_RED, -1, 0),
+        (COLOR_PAIR_CYAN, curses.COLOR_CYAN, -1, 0),
+        (COLOR_PAIR_MAGENTA, curses.COLOR_MAGENTA, -1, 0),
+        (COLOR_PAIR_BLUE, curses.COLOR_BLUE, -1, 0),
+        (COLOR_PAIR_LOCAL, curses.COLOR_CYAN, -1, 0),
+        (COLOR_PAIR_CLOUD, curses.COLOR_MAGENTA, -1, 0),
+        (COLOR_PAIR_BAR_FULL, curses.COLOR_GREEN, -1, 0),
     ]
-    for pair, fg, bg in pairs:
+
+    # Pares que usan color "gris" (8). Solo si la terminal soporta >=16 colores.
+    if not limited:
+        try:
+            # COLOR_GRAY real existe en ncurses 1.9.9+ (no en 8-color).
+            # Si no, usamos un fallback: dim white.
+            if hasattr(curses, 'COLOR_GRAY') and curses.COLOR_GRAY < n_colors:
+                pairs.append((COLOR_PAIR_GRAY, curses.COLOR_GRAY, -1, 0))
+            else:
+                pairs.append((COLOR_PAIR_GRAY, curses.COLOR_WHITE, -1, curses.A_DIM))
+        except (curses.error, ValueError, AttributeError):
+            pass
+
+    # Bar vacía: usa dim white en lugar de gris.
+    pairs.append((COLOR_PAIR_BAR, curses.COLOR_WHITE, -1, curses.A_DIM))
+
+    # Highlight: solo si la terminal tiene COLOR_BLACK.
+    if curses.COLOR_BLACK < n_colors:
+        pairs.append((COLOR_PAIR_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN, 0))
+
+    for pair, fg, bg, attrs in pairs:
+        if pair >= n_pairs:
+            continue  # terminal no soporta tantos pares
         try:
             curses.init_pair(pair, fg, bg)
-        except curses.error:
-            pass  # Algunos pares pueden no estar disponibles en terminales limitadas.
+        except (curses.error, ValueError):
+            pass  # Color no soportado, seguimos.
+
     return True
 
 
@@ -162,6 +199,11 @@ def model_color(model_id: str) -> int:
     if model_id.startswith('codex:'):
         return curses.color_pair(COLOR_PAIR_CLOUD)
     return curses.color_pair(COLOR_PAIR_DEFAULT)
+
+
+def gray_attr() -> int:
+    """Atributo para texto 'gris' (dim) que funciona en cualquier terminal."""
+    return curses.A_DIM
 
 
 def model_family_short(model_id: str) -> str:
@@ -352,7 +394,7 @@ def draw_header(stdscr, status: dict, harness_alive: bool, y: int = 0) -> int:
     pos += len("  │  Opus: ")
     stdscr.addstr(y, pos, f"{opus} invocaciones", curses.color_pair(opus_color) | curses.A_BOLD)
     y += 1
-    stdscr.addstr(y, 1, '─' * (w - 2), curses.color_pair(COLOR_PAIR_GRAY))
+    stdscr.addstr(y, 1, '─' * (w - 2), gray_attr())
     return y + 1
 
 
@@ -366,7 +408,7 @@ def draw_cadence_panel(stdscr, counts: Counter, y: int, height: int) -> int:
     y += 1
     if not counts:
         stdscr.addstr(y, 3, "(sin actividad en los últimos 30s)",
-                     curses.color_pair(COLOR_PAIR_GRAY))
+                     gray_attr())
         return y + 1
     max_count = max(counts.values()) or 1
     bar_width = max(8, w - 50)
@@ -410,7 +452,7 @@ def draw_system_panel(stdscr, cpu: dict, gpus: list, ollama: list, y: int) -> in
         idle_color = COLOR_PAIR_DEFAULT
     stdscr.addstr(y, 7, f"idle {idle}%  ", curses.color_pair(idle_color) | curses.A_BOLD)
     stdscr.addstr(y, 19, f"load {cpu.get('load', '?')}",
-                 curses.color_pair(COLOR_PAIR_GRAY))
+                 gray_attr())
     y += 1
     # GPUs.
     for gpu in gpus:
@@ -451,7 +493,7 @@ def draw_log_panel(stdscr, log_buffer: LogBuffer, y: int, height: int) -> int:
                  curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
     y += 1
     if not log_buffer.lines:
-        stdscr.addstr(y, 3, "(log vacío)", curses.color_pair(COLOR_PAIR_GRAY))
+        stdscr.addstr(y, 3, "(log vacío)", gray_attr())
         return y + 1
     # Mostrar las últimas N líneas que entren, con scroll.
     visible = height - 1
@@ -474,7 +516,7 @@ def draw_log_panel(stdscr, log_buffer: LogBuffer, y: int, height: int) -> int:
             # Calcular segundos desde ahora.
             ago = int(time.time() - ts)
             prefix = f"-{ago:>3d}s  " if ago < 60 else f"-{ago//60}m{ago%60:02d}s  "
-            stdscr.addstr(y, 1, prefix, curses.color_pair(COLOR_PAIR_GRAY))
+            stdscr.addstr(y, 1, prefix, gray_attr())
             stdscr.addstr(y, 1 + len(prefix), line[:w - 2 - len(prefix)], color)
         except curses.error:
             pass
@@ -489,7 +531,7 @@ def draw_footer(stdscr, paused: bool, layout: str):
         "ON" if paused else "off", layout,
     )
     stdscr.addstr(h - 1, max(1, (w - len(keys)) // 2), keys,
-                 curses.color_pair(COLOR_PAIR_GRAY))
+                 gray_attr())
 
 
 def main(stdscr):
@@ -593,7 +635,7 @@ def main(stdscr):
             y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
             y += 1
             stdscr.addstr(y, 1, "  (layout 'metrics': log oculto — pulsa 'l' para cambiar)",
-                         curses.color_pair(COLOR_PAIR_GRAY))
+                         gray_attr())
         # Footer.
         draw_footer(stdscr, paused, layout)
         stdscr.refresh()

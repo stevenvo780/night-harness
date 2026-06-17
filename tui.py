@@ -725,90 +725,89 @@ def _short_model(mid: str) -> str:
 
 
 def draw_process_containers(stdscr, status: dict, y: int) -> int:
-    """Dashboard tab: 1 contenedor por CATEGORÍA (hunters, cloud, filters, judges, fixers).
+    """Dashboard ultra-compacto: 1 fila por tier + orquestador. Iconos de estado.
 
-    Cada contenedor muestra: nombre de la categoría, estado (activos/total),
-    y lista de agentes con su modelo, calls, y archivo actual.
+    Diseño:
+      🔍 Locales    🟢🟢🟢⚪⚪  30B×2, CPU×2                        12 calls
+      ☁️ Cloud      🟢🟢🟢🟢⚪⚪  flash-lite, dsv4-free, ...          8 calls
+      🔬 Filtros    🟢🟢🟢🟢🟢🟢  m2.7, flash-lite, n-mini, ...     45 calls
+      ⚖️ Jueces     🟢🟢⚪  m3, kimi-k2.7, dsv4-pro                    3 calls
+      🧠 Orquest.   ✓ 30 prompts, 2 journeys                          (cache)
     """
     h, w = stdscr.getmaxyx()
     threads = status.get('threads', [])
-    if not threads:
-        stdscr.addstr(y, 1, '  (sin threads aún — esperando arranque)',
-                     curses.color_pair(COLOR_PAIR_DEFAULT) | curses.A_DIM)
-        return y + 2
 
-    # Agrupar por kind.
-    cats = {
-        'hunter': ('⟦CAZADORES locales⟧', COLOR_PAIR_HEADER),
-        'cloud':  ('⟦CAZADORES cloud⟧', COLOR_PAIR_GREEN),
-        'filter': ('⟦FILTROS⟧', COLOR_PAIR_DEFAULT),
-        'judge':  ('⟦JUECES⟧', COLOR_PAIR_MAGENTA),
-        'fixer':  ('⟦FIXERS⟧', COLOR_PAIR_RED),
-    }
+    # Iconos de estado.
+    BUSY_ICON = '●'   # 🟢 activo
+    IDLE_ICON = '○'   # ⚪ inactivo
+
+    ORDER = [
+        ('hunter', '🔍 Locales', '🟤'),
+        ('cloud',  '☁️ Cloud',   '🔵'),
+        ('filter', '🔬 Filtros', '🟣'),
+        ('judge',  '⚖️ Jueces',  '🟡'),
+        ('fixer',  '🔧 Fixers',  '🔴'),
+    ]
+
     grouped: dict[str, list[dict]] = {}
     for t in threads:
-        k = t.get('kind', 'other')
-        grouped.setdefault(k, []).append(t)
+        grouped.setdefault(t.get('kind', '?'), []).append(t)
 
-    box_w = max(45, w - 4)
-    current_y = y
-    for cat_key, (cat_label, cat_color) in cats.items():
+    for cat_key, label, _ in ORDER:
         agents = grouped.get(cat_key, [])
         if not agents:
             continue
-        busy = sum(1 for a in agents if a.get('status') == 'busy')
-        idle_count = sum(1 for a in agents if a.get('status') == 'idle')
-        total_calls = sum(a.get('calls', 0) for a in agents)
-        n = len(agents)
-        box_h = 3 + min(n, 8)  # 3 líneas de header + 1 por agente (max 8)
-        if current_y + box_h >= h - 3:
-            break
+        busy_n = sum(1 for a in agents if a.get('status') == 'busy')
+        total = len(agents)
+        calls = sum(a.get('calls', 0) for a in agents)
 
-        bx, by = 1, current_y
-        # Marco.
+        # Fila de iconos de status.
+        icons = ''
+        for a in agents[:10]:
+            icons += BUSY_ICON if a.get('status') == 'busy' else IDLE_ICON
+        if total > 10:
+            icons += f' +{total - 10}'
+
+        # Modelos únicos abreviados.
+        models = sorted(set(_short_model(a.get('model', '?')) for a in agents))
+        model_str = ', '.join(models[:5])
+        if len(models) > 5:
+            model_str += f' +{len(models) - 5}'
+
+        line = f' {label:14s} {icons:14s} {model_str[:45]:45s} {calls}c'
         try:
-            stdscr.addstr(by, bx, '╔' + '═' * (box_w - 2) + '╗',
-                         curses.color_pair(cat_color) | curses.A_BOLD)
-            for li in range(1, box_h):
-                stdscr.addstr(by + li, bx, '║', curses.color_pair(cat_color) | curses.A_BOLD)
-                stdscr.addstr(by + li, bx + box_w - 1, '║',
-                             curses.color_pair(cat_color) | curses.A_BOLD)
-            stdscr.addstr(by + box_h, bx, '╚' + '═' * (box_w - 2) + '╝',
-                         curses.color_pair(cat_color) | curses.A_BOLD)
+            attr = curses.color_pair(COLOR_PAIR_DEFAULT)
+            if busy_n > 0:
+                attr |= curses.A_BOLD
+            stdscr.addstr(y, 1, line[:w - 2], attr)
         except curses.error:
             pass
-        # Header.
-        header = f' {cat_label}    {busy} activos / {n} total    calls={total_calls}'
-        stdscr.addstr(by + 1, bx + 2, header[:box_w - 4],
-                      curses.color_pair(cat_color) | curses.A_BOLD)
-        # Línea separadora.
-        stdscr.addstr(by + 2, bx + 1, '─' * (box_w - 2), gray_attr())
-        # Agentes (máximo 8).
-        agent_y = by + 3
-        for a in agents[:8]:
-            name = a.get('name', '?')
-            model_s = _short_model(a.get('model', '?'))
-            status_s = a.get('status', 'idle')
-            calls = a.get('calls', 0)
-            file_s = (a.get('current_file', '') or '')[-35:]
-            task_s = (a.get('current_task', '') or '')[:20]
-            # Color por status.
-            sc = (COLOR_PAIR_GREEN | curses.A_BOLD if status_s == 'busy'
-                  else gray_attr())
-            line = (f'  {name:10s} [{status_s:4s}] {model_s:22s} '
-                    f'calls={calls:>3}  {task_s}')
+        y += 1
+
+        # Archivos actuales (solo si hay busy).
+        if busy_n > 0:
+            busy_list = [a for a in agents if a.get('status') == 'busy']
+            files_line = '   └─ '
+            for a in busy_list[:3]:
+                fn = (a.get('current_file', '') or '?').split('/')[-1][:22]
+                files_line += f'{a["name"]}:{fn}  '
             try:
-                stdscr.addstr(agent_y, bx + 2, line[:box_w - 4],
-                             curses.color_pair(COLOR_PAIR_DEFAULT))
-                if file_s:
-                    stdscr.addstr(agent_y + 1, bx + 4, f'└─ {file_s}'[:box_w - 6],
-                                  gray_attr())
-                    agent_y += 1
+                stdscr.addstr(y, 1, files_line[:w - 2], gray_attr())
             except curses.error:
                 pass
-            agent_y += 1
-        current_y = by + box_h + 1
-    return current_y
+            y += 1
+
+    # Orquestador.
+    orch_prompts = len(status.get('orchestrator', {}).get('hunting_prompts', []))
+    orch_journeys = len(status.get('orchestrator', {}).get('e2e_journeys', []))
+    if orch_prompts or orch_journeys:
+        orch_line = f' 🧠 Orquest.   ✓ {orch_prompts} prompts, {orch_journeys} journeys'
+        try:
+            stdscr.addstr(y, 1, orch_line[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+        except curses.error:
+            pass
+        y += 1
+    return y
 
 
 def draw_stats_panel(stdscr, status: dict, y: int) -> int:
@@ -1067,14 +1066,9 @@ def main(stdscr):
         y = draw_tabs_header(stdscr, current_tab, y=y)
         # Render según tab activa.
         if current_tab == 'dashboard':
-            # Cuadrícula de contenedores por thread.
             y = draw_process_containers(stdscr, last_status, y)
-            # Sistema compacto abajo.
             if y < h - 12:
                 y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
-            # Mini log al final.
-            if y < h - 4:
-                y = draw_log_panel(stdscr, log, y, h - y - 2)
         elif current_tab == 'models':
             # Cadencia + sistema (vista de modelos).
             cad_h = max(4, len(last_counts) + 2)

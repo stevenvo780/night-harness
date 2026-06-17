@@ -168,6 +168,10 @@ STATS = {
     'started_at': time.time(),
 }
 
+# Estado del orquestador (se actualiza en main).
+_current_orch_prompts = []
+_current_e2e_journeys = []
+
 
 # ---------------------------------------------------------------------------
 # Estado por-thread (para la TUI dashboard).
@@ -213,6 +217,11 @@ def write_status() -> None:
         'uptime_sec': int(time.time() - STATS['started_at']),
         'quota': quota.local_spend(),
         'threads': get_thread_states(),
+        'orchestrator': {
+            'model': orchestrator.ORCHESTRATOR_MODEL,
+            'hunting_prompts': len(_current_orch_prompts),
+            'e2e_journeys': len(_current_e2e_journeys) if _current_e2e_journeys else 0,
+        },
         'memory': {
             'total_rounds': MEM.total_rounds,
             'total_bugs_found': MEM.total_bugs_found,
@@ -1364,6 +1373,7 @@ def main() -> None:
     hunting_prompts = orchestrator.generate_hunting_prompts(
         str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
     )
+    _current_orch_prompts = hunting_prompts or []
     if hunting_prompts:
         log(f'  [main] Orquestador: {len(hunting_prompts)} prompts dirigidos generados')
         # Log de muestra: primeros 3 prompts
@@ -1377,6 +1387,7 @@ def main() -> None:
                 str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
             )
             if e2e_journeys:
+                _current_e2e_journeys = e2e_journeys
                 log(f'  [main] Orquestador: {len(e2e_journeys)} journeys E2E generados')
     else:
         log('  [main] Orquestador no generó prompts (cache o fallback heurístico)')

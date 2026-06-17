@@ -26,7 +26,6 @@ USO:
 from __future__ import annotations
 
 import curses
-import curses.panel
 import json
 import os
 import re
@@ -61,23 +60,36 @@ COLOR_PAIR_BAR_FULL = 13  # barra "llena" cuando hay cadencia alta
 COLOR_PAIR_HIGHLIGHT = 14
 
 
-def init_colors():
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(COLOR_PAIR_DEFAULT, -1, -1)
-    curses.init_pair(COLOR_PAIR_HEADER, curses.COLOR_CYAN, -1)
-    curses.init_pair(COLOR_PAIR_GREEN, curses.COLOR_GREEN, -1)
-    curses.init_pair(COLOR_PAIR_YELLOW, curses.COLOR_YELLOW, -1)
-    curses.init_pair(COLOR_PAIR_RED, curses.COLOR_RED, -1)
-    curses.init_pair(COLOR_PAIR_CYAN, curses.COLOR_CYAN, -1)
-    curses.init_pair(COLOR_PAIR_MAGENTA, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(COLOR_PAIR_BLUE, curses.COLOR_BLUE, -1)
-    curses.init_pair(COLOR_PAIR_GRAY, 8, -1)
-    curses.init_pair(COLOR_PAIR_LOCAL, curses.COLOR_CYAN, -1)
-    curses.init_pair(COLOR_PAIR_CLOUD, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(COLOR_PAIR_BAR, 8, -1)
-    curses.init_pair(COLOR_PAIR_BAR_FULL, curses.COLOR_GREEN, -1)
-    curses.init_pair(COLOR_PAIR_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN)
+def init_colors() -> bool:
+    """Inicializa los pares de color. Retorna False si no se pudo (terminal
+    sin soporte de color)."""
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except curses.error:
+        return False
+    pairs = [
+        (COLOR_PAIR_DEFAULT, -1, -1),
+        (COLOR_PAIR_HEADER, curses.COLOR_CYAN, -1),
+        (COLOR_PAIR_GREEN, curses.COLOR_GREEN, -1),
+        (COLOR_PAIR_YELLOW, curses.COLOR_YELLOW, -1),
+        (COLOR_PAIR_RED, curses.COLOR_RED, -1),
+        (COLOR_PAIR_CYAN, curses.COLOR_CYAN, -1),
+        (COLOR_PAIR_MAGENTA, curses.COLOR_MAGENTA, -1),
+        (COLOR_PAIR_BLUE, curses.COLOR_BLUE, -1),
+        (COLOR_PAIR_GRAY, 8, -1),
+        (COLOR_PAIR_LOCAL, curses.COLOR_CYAN, -1),
+        (COLOR_PAIR_CLOUD, curses.COLOR_MAGENTA, -1),
+        (COLOR_PAIR_BAR, 8, -1),
+        (COLOR_PAIR_BAR_FULL, curses.COLOR_GREEN, -1),
+        (COLOR_PAIR_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN),
+    ]
+    for pair, fg, bg in pairs:
+        try:
+            curses.init_pair(pair, fg, bg)
+        except curses.error:
+            pass  # Algunos pares pueden no estar disponibles en terminales limitadas.
+    return True
 
 
 class LogBuffer:
@@ -481,9 +493,22 @@ def draw_footer(stdscr, paused: bool, layout: str):
 
 
 def main(stdscr):
+    # Validar tamaño de terminal.
+    h, w = stdscr.getmaxyx()
+    if h < 20 or w < 80:
+        # Terminal muy pequeña — avisar y salir.
+        stdscr.addstr(0, 0, f"Terminal muy pequeña ({h}x{w}). Mínimo 20x80.")
+        stdscr.addstr(1, 0, "Resize la terminal y vuelve a lanzar la TUI.")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
     init_colors()
     stdscr.nodelay(True)  # getch() no bloquea
-    curses.curs_set(0)  # ocultar cursor
+    try:
+        curses.curs_set(0)  # ocultar cursor (puede fallar en algunas terminales)
+    except curses.error:
+        pass  # Algunas terminales no soportan ocultar el cursor.
 
     log = LogBuffer()
     last_refresh = 0.0
@@ -576,10 +601,34 @@ def main(stdscr):
 
 
 if __name__ == '__main__':
+    # Sanity check: curses solo funciona con un TTY real.
+    if not sys.stdout.isatty():
+        print("Error: la TUI requiere un TTY real (no funciona redirigido).",
+              file=sys.stderr)
+        print("Lánzala desde una terminal interactiva.", file=sys.stderr)
+        sys.exit(1)
+    # Verificar TERM.
+    if not os.environ.get('TERM'):
+        os.environ['TERM'] = 'xterm-256color'
     try:
+        # curses.wrapper se encarga de initscr/endwin/cbreak/nocbreak automáticamente.
+        # Si algo falla dentro de main, el cleanup es robusto.
         curses.wrapper(main)
     except KeyboardInterrupt:
-        pass
+        # Restaurar terminal explícitamente (a veces curses.wrapper no lo hace
+        # del todo bien cuando hay un KeyboardInterrupt dentro de nodelay).
+        try:
+            curses.nocbreak()
+            curses.endwin()
+        except curses.error:
+            pass
+    except curses.error as e:
+        print(f"\n[Error de curses: {e}]", file=sys.stderr)
+        print("La TUI requiere ncurses. En Linux: sudo apt install libncurses-dev",
+              file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f'Error: {e}', file=sys.stderr)
+        print(f"\n[Error inesperado: {e}]", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)

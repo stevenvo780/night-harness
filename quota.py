@@ -269,6 +269,78 @@ def filter_tier(specs: tuple, role: str) -> list:
     return out
 
 
+def _remaining_pct(model_id: str) -> float:
+    """Devuelve el % de cuota RESTANTE para un modelo (100 = todo libre).
+
+    Para modelos sin tracking (locales, opencode, sin datos) devuelve 100.
+    Si está sobre el 100% de su límite, devuelve 0.
+    """
+    if model_id.startswith('ollama:') or model_id.startswith('opencode:'):
+        return 100.0
+    state = refresh()
+    normalized = _normalize_model_name(model_id)
+    info = state.by_model_pct.get(normalized, {})
+    if not info:
+        return 100.0
+    # El "más restrictivo" entre daily y weekly gana.
+    worst = 100.0
+    for period in ('daily', 'weekly'):
+        limit = get_limit(normalized, period)
+        if not limit:
+            continue
+        tokens = info.get(f'{period}_tokens', 0)
+        proxy_limit = {
+            'claude-sonnet-4-5': 50_000_000,
+            'claude-sonnet-4-6': 50_000_000,
+            'claude-opus-4-6': 10_000_000,
+            'claude-haiku-4-5': 100_000_000,
+            'codex-mini': 30_000_000,
+            'gemini-2.5-pro': 50_000_000,
+            'gemini-2.5-flash': 200_000_000,
+            'gemini-2.5-flash-lite': 500_000_000,
+            'gemini-3-pro-preview': 50_000_000,
+            'gemini-3-flash-preview': 200_000_000,
+        }.get(normalized, 50_000_000)
+        pct_used = (tokens / proxy_limit) * 100
+        pct_remaining = max(0.0, limit - pct_used)
+        worst = min(worst, pct_remaining)
+    return worst
+
+
+def smart_pick(specs: tuple, role: str) -> Optional['tiers.ModelSpec']:
+    """Selector "abundancia": elige el MEJOR modelo disponible AHORA.
+
+    Algoritmo:
+      1. Filtra los specs que pasan `is_model_ok` (cuota OK).
+      2. Para cada uno, calcula `remaining_pct` (cuota restante).
+      3. Puntuación = remaining_pct * (10 - relative_cost) / 10
+         (más cuota restante + más barato = mejor)
+      4. Si todos están KO (cuota agotada), devuelve el de mayor `remaining_pct`
+         (rotación de gracia: aunque esté casi agotado, lo usa brevemente para
+         mantener la cola llena — el siguiente ciclo elegirá otro).
+
+    NO es exhaustivo: un solo `best` por llamada. El caller itera si falla.
+    """
+    candidates = [s for s in specs if is_model_ok(s.id)]
+    if not candidates:
+        # Todos KO: devolver el de mayor remaining_pct (rotación).
+        all_with_pct = [(s, _remaining_pct(s.id)) for s in specs]
+        all_with_pct.sort(key=lambda kv: -kv[1])
+        return all_with_pct[0][0] if all_with_pct else None
+    scored = []
+    for s in candidates:
+        rem = _remaining_pct(s.id)
+        # relative_cost 1-10: barato = 1, caro = 10. Invertimos: 10-cost (alto = bueno)
+        # Calidad "implícita" = strength del spec + coste bajo.
+        quality_hint = (11 - min(s.relative_cost, 10)) / 10.0
+        # Score: combina remaining con calidad. Más remaining = usa más.
+        # Más calidad = prefiere ese modelo (no el más barato).
+        score = (rem / 100.0) * (0.6 + 0.4 * quality_hint)
+        scored.append((s, score))
+    scored.sort(key=lambda kv: -kv[1])
+    return scored[0][0]
+
+
 # ---------------------------------------------------------------------------
 # Tracking local (el harness anota cada llamada que hace; sirve para reportar
 # gasto al final del run aunque ai-usage tarde en reflejarlo).

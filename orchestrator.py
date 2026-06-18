@@ -278,7 +278,21 @@ CLAVES de bug-hunting:
 - Dinero: ¿cobros exceden saldo? ¿descuentos aplican correctamente?
 - Carrera: ¿operaciones no atómicas en stock/cartera?
 
-Genera 15 hunting_prompts y 5 e2e_journeys."""
+Genera 15 hunting_prompts y 20 e2e_journeys complejos multi-paso.
+
+Para cada e2e_journey, los steps DEBEN ser específicos y testeables (URLs concretas, no "el usuario hace algo"). Piensa en journeys que cubran:
+  - Flujos de dinero (cobros, pagos, descuentos, saldo, factura)
+  - Transiciones de estado de pedidos (recibido→aceptado→en_cola→enrutado→despachado)
+  - Multi-tenant (cambiar de organización y ver datos aislados)
+  - Auth (intentar acciones sin permiso, con rol incorrecto)
+  - Validación de inputs negativos (montos, stock, fechas)
+  - Race conditions (doble submit, edición concurrente)
+  - Errores esperados (404, 403, 500, validación)
+  - Listas paginadas con muchos datos
+  - Formularios con campos faltantes o inválidos
+  - Modales abiertos/cerrados correctamente
+  - Navegación entre rutas con permisos distintos
+"""
 
 
 def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:

@@ -148,6 +148,10 @@ class Bug:
 
 suspectq: queue.Queue[Suspect] = queue.Queue(maxsize=200)
 bugq: queue.Queue[Bug] = queue.Queue(maxsize=50)
+# Cola de tareas E2E: cada item es (route, module_label, depth_hint).
+# La llena el productor (orquestador + discover_zones + journeys).
+# Los workers E2E consumen y reportan hallazgos a suspectq.
+e2e_taskq: queue.Queue[tuple[str, str, int]] = queue.Queue(maxsize=400)
 
 
 # ---------------------------------------------------------------------------
@@ -1803,65 +1807,173 @@ def _map_e2e_route_to_file(route: str) -> Optional[str]:
     return None
 
 def e2e_sweep_worker(zone: str) -> None:
-    """Corre el crawler E2E contra una zona y emite suspectq con hallazgos.
+    """DEPRECATED wrapper. Usar e2e_task_worker en su lugar (consume e2e_taskq)."""
+    return _e2e_task_worker()
 
-    Usa el contrato REAL de e2e-runner.js: escenario JSON por stdin
-    ({baseURL,route,storageState?,maxActions?,budgetMs?}) → objeto JSON
-    {route,ok,errors:[{kind,where,detail}]}. (El código viejo pasaba flags
-    `--zone`/`--dev-url` que el runner NO acepta → 0 hallazgos siempre.)
+
+def _e2e_task_worker(wid: int = 0) -> None:
+    """Worker E2E: consume tareas de `e2e_taskq` y emite hallazgos a suspectq.
+
+    Cada task es (route, module_label, depth_hint). El worker:
+      1. Construye el escenario JSON para e2e-runner.js.
+      2. Ejecuta el crawler Playwright contra `route`.
+      3. Parsea errores (consola/#419/HTTP≥400/UI).
+      4. Mapea cada error a un archivo del worktree.
+      5. Emite un Suspect a suspectq para que pase por filter→judge→fixer.
+
+    Si la cola se vacía, espera bloqueado. Cuando llega un task, lo procesa.
+    Si el dev server está caído, sale con un warning (el watchdog lo despertará).
     """
-    if not STORAGE and not DYN_ID:
-        return  # modo demo, ya cubierto por el smoke global
-    route = '/' + zone.replace('app/(panel)/', '').strip('/')
-    log(f'  [e2e-sweep] {route} arrancando')
-    scn = {
-        'baseURL': DEV_URL,
-        'route': route,
-        'maxActions': int(os.environ.get('LOOP_E2E_ACTIONS', '24')),
-        'budgetMs': int(os.environ.get('LOOP_E2E_BUDGET_MS', '70000')),
-    }
-    if STORAGE:
-        scn['storageState'] = STORAGE
     runner = str(Path(__file__).parent / 'e2e-runner.js')
-    env = dict(os.environ)
-    env.setdefault('DASHBOARD_NM', str(WT_SUBDIR / 'node_modules'))
-    try:
-        result = subprocess.run(
-            ['node', runner], input=json.dumps(scn),
-            cwd=str(WT_SUBDIR), env=env,
-            capture_output=True, text=True, timeout=180,
-        )
-        out = json.loads(result.stdout)
-    except subprocess.TimeoutExpired:
-        log(f'  [e2e-sweep] {route} timeout')
-        return
-    except json.JSONDecodeError:
-        log(f'  [e2e-sweep] {route} salida no-JSON: {(result.stdout or "")[:160]}')
-        return
-    if out.get('fatal'):
-        log(f'  [e2e-sweep] {route} fatal: {str(out.get("fatal"))[:140]}')
-        return
-    errors = out.get('errors', [])
-    for err in errors:
-        with STATS_LOCK:
-            STATS['e2e_findings'] += 1
-        kind = err.get('kind', '?')
-        where = err.get('where', route)
-        detail = str(err.get('detail', ''))
-        e2e_route = out.get('route', route)
-        mapped_file = _map_e2e_route_to_file(e2e_route)
-        if not mapped_file:
-            log(f'    [e2e] route {e2e_route} no mapeada a archivo; skip')
+    log(f'  [e2e-{wid}] worker arrancando (consume e2e_taskq)')
+    while not shutdown.is_set():
+        try:
+            task = e2e_taskq.get(timeout=5)
+        except queue.Empty:
             continue
-        yield_suspect(Suspect(
-            file=mapped_file,
-            line=0,
-            snippet=detail[:100],
-            why=f'E2E {kind}@{where}: {detail[:120]}',
-            severity='high',
-            source='e2e',
-        ))
-    log(f'  [e2e-sweep] {route}: {len(errors)} hallazgos')
+        route, module_label, depth_hint = task
+        # El productor usa un sentinel None para shutdown ordenado.
+        if route is None:
+            e2e_taskq.task_done()
+            break
+        if not DEV_URL:
+            e2e_taskq.task_done()
+            continue
+        # Si el dev server no responde, no malgastemos budget; el watchdog lo revive.
+        if not _dev_server_alive():
+            with STATS_LOCK:
+                STATS['e2e_devserver_skips'] = STATS.get('e2e_devserver_skips', 0) + 1
+            e2e_taskq.task_done()
+            time.sleep(2)
+            continue
+        scn = {
+            'baseURL': DEV_URL,
+            'route': route,
+            'maxActions': int(os.environ.get('LOOP_E2E_ACTIONS', '24')),
+            'budgetMs': int(os.environ.get('LOOP_E2E_BUDGET_MS', '70000')),
+        }
+        if STORAGE:
+            scn['storageState'] = STORAGE
+        env = dict(os.environ)
+        env.setdefault('DASHBOARD_NM', str(WT_SUBDIR / 'node_modules'))
+        try:
+            result = subprocess.run(
+                ['node', runner], input=json.dumps(scn),
+                cwd=str(WT_SUBDIR), env=env,
+                capture_output=True, text=True, timeout=180,
+            )
+            out = json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            log(f'  [e2e-{wid}] {route} timeout')
+            e2e_taskq.task_done()
+            continue
+        except json.JSONDecodeError:
+            log(f'  [e2e-{wid}] {route} salida no-JSON: {(result.stdout or "")[:160]}')
+            e2e_taskq.task_done()
+            continue
+        if out.get('fatal'):
+            log(f'  [e2e-{wid}] {route} fatal: {str(out.get("fatal"))[:140]}')
+            e2e_taskq.task_done()
+            continue
+        errors = out.get('errors', [])
+        if errors:
+            log(f'  [e2e-{wid}] {route} → {len(errors)} hallazgos (mod={module_label})')
+        for err in errors:
+            with STATS_LOCK:
+                STATS['e2e_findings'] += 1
+            kind = err.get('kind', '?')
+            where = err.get('where', route)
+            detail = str(err.get('detail', ''))
+            e2e_route = out.get('route', route)
+            mapped_file = _map_e2e_route_to_file(e2e_route)
+            if not mapped_file:
+                log(f'    [e2e-{wid}] route {e2e_route} no mapeada a archivo; skip')
+                continue
+            # Emitir un Suspect al pipeline filter→judge→fixer.
+            sus = Suspect(
+                file=mapped_file,
+                line=int(err.get('line', 1)) if str(err.get('line', '')).isdigit() else 1,
+                snippet=str(err.get('detail', ''))[:200],
+                why=f'E2E {kind} en {route} ({module_label}): {detail[:160]}',
+                severity='high' if kind in ('http500', 'crash', 'fatal') else 'medium',
+                repro=f'curl {DEV_URL}{route}  (ver consola + network tab)',
+                confidence=0.7,
+                samples=1,
+                source='e2e',
+            )
+            yield_suspect(sus)
+        e2e_taskq.task_done()
+    log(f'  [e2e-{wid}] worker terminado')
+
+
+def _dev_server_alive() -> bool:
+    """Chequeo barato: el dev_url responde algo (HTTP 200/3xx/4xx = vivo)."""
+    try:
+        req = urllib.request.Request(DEV_URL, method='HEAD')
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.status < 600
+    except Exception:
+        return False
+
+
+def e2e_producer(stop_event: threading.Event) -> None:
+    """Productor: llena e2e_taskq con rutas del orquestador + zonas + journeys.
+
+    Estrategia "abundancia":
+      - Rutas de discover_zones (panel modules) — una vez cada una.
+      - Rutas de las journeys del orquestador (primer step de cada journey).
+      - Sub-rutas de las journeys (steps siguientes) para multi-paso.
+      - Vuelve a encolar si la cola baja de un umbral (siempre tiene tareas).
+    """
+    log('  [e2e-prod] productor arrancando')
+    produced = set()
+    while not stop_event.is_set():
+        # 1) Rutas base del panel.
+        with _ORCH_LOCK:
+            orch_journeys = list(_current_e2e_journeys)
+        base_routes: list[tuple[str, str, int]] = []
+        for zone in discover_zones():
+            route = '/' + zone.replace('app/(panel)/', '').strip('/')
+            base_routes.append((route, zone.split('/')[-1] or 'panel', 1))
+        # 2) Rutas de las journeys (primer step y resto de steps).
+        for j in orch_journeys:
+            mod = j.module or 'general'
+            for i, step in enumerate(j.steps or []):
+                # step puede ser una URL o una descripción. Si parece URL, usar.
+                if isinstance(step, str) and step.startswith('/'):
+                    base_routes.append((step, mod, min(i + 1, 3)))
+                # Si no, generar un slug de búsqueda en zonas del módulo.
+                else:
+                    slug = (step or '').lower().replace(' ', '-')[:40]
+                    for zone in discover_zones():
+                        if mod in zone or slug in zone.lower():
+                            route = '/' + zone.replace('app/(panel)/', '').strip('/')
+                            base_routes.append((route, mod, min(i + 1, 3)))
+        # 3) Rutas de auth/públicas (siempre vale la pena crawlearlas).
+        for extra in ['/sign-in', '/sign-up', '/inicio', '/']:
+            base_routes.append((extra, 'auth', 1))
+        # Encolar las nuevas.
+        added = 0
+        for route, mod, depth in base_routes:
+            key = (route, mod, depth)
+            if key in produced:
+                continue
+            produced.add(key)
+            try:
+                e2e_taskq.put_nowait((route, mod, depth))
+                added += 1
+            except queue.Full:
+                break
+        if added:
+            log(f'  [e2e-prod] encoladas {added} tareas nuevas (queue={e2e_taskq.qsize()})')
+        # Esperar a que baje el backlog antes de re-producir (mantiene cola larga).
+        for _ in range(60):
+            if stop_event.is_set():
+                break
+            if e2e_taskq.qsize() < 50:
+                break
+            time.sleep(2)
+    log('  [e2e-prod] productor terminado')
 
 
 # ---------------------------------------------------------------------------
@@ -2201,14 +2313,25 @@ def main() -> None:
         t.start()
         worker_threads.append(t)
 
-    # E2E sweep (en paralelo con code hunting).
+    # E2E: productor + N workers que consumen e2e_taskq (cola larga).
+    # El productor llena con discover_zones + journeys del orquestador +
+    # rutas de auth. Los workers crawlean en paralelo y emiten a suspectq.
+    E2E_WORKERS = int(os.environ.get('LOOP_E2E_WORKERS', '8'))
     if not args.no_e2e:
-        for zone in discover_zones()[:5]:  # limita a 5 zonas
+        # 1) Productor: mantiene la cola llena.
+        t = threading.Thread(
+            target=e2e_producer, args=(shutdown,), daemon=True, name='e2e-prod'
+        )
+        t.start()
+        worker_threads.append(t)
+        # 2) Workers consumidores: N hilos que sacan tareas de e2e_taskq.
+        for i in range(E2E_WORKERS):
             t = threading.Thread(
-                target=e2e_sweep_worker, args=(zone,), daemon=True, name=f'e2e-{zone}'
+                target=_e2e_task_worker, args=(i,), daemon=True, name=f'e2e-w{i}'
             )
             t.start()
             worker_threads.append(t)
+        log(f'  [main] E2E: productor + {E2E_WORKERS} workers activos')
 
     # Main loop: converge-and-stop. NO termina el run prematuramente;
     # solo avisa cuando hay N rondas limpias (el código está estable). El run

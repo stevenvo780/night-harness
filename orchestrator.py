@@ -337,14 +337,23 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
         return json.loads(text)
     except json.JSONDecodeError:
         # Buscar bloque JSON entre ```json ... ``` o { ... }
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(1))
+        try:
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
         # Buscar primer { y último }
-        start = text.find('{')
-        end = text.rfind('}')
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
+        try:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start >= 0 and end > start:
+                return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+        # Si el modelo devolvió JSON malformado, log + cache vacío.
+        # No crashear: el caller tiene fallback heurístico.
+        print(f'  [orch] respuesta NO es JSON válido ({len(text)} chars, head={text[:120]!r})')
     return None
 
 

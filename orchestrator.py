@@ -303,9 +303,11 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
         except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             print(f'  [orch] gemini CLI falló: {e}')
             return None
-    elif ORCHESTRATOR_MODEL.startswith('opencode'):
+    elif ORCHESTRATOR_MODEL.startswith(('opencode', 'minimax')):
         # opencode run lee de stdin (--model <id> -). Evitamos pasar el prompt
         # como argumento CLI porque el snapshot es grande (~23K chars).
+        # minimax/* también se invoca por opencode (verificado), así que entra aquí
+        # — antes el default minimax/MiniMax-M3 caía a None y mataba los prompts dirigidos.
         model_id = ORCHESTRATOR_MODEL.replace(':', '/', 1)
         system_prompt = ORCHESTRATOR_SYSTEM.replace('"', '\\"')
         stdin_input = f'<<SYS>>\n{system_prompt}\n<</SYS>>\n\n{snapshot}'

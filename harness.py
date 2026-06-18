@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 """
-HARNESS v6 "Adaptativo" — auto-endurecimiento nocturno E2E.
+HARNESS v7 Demeter — auto-endurecimiento nocturno E2E multi-fase.
 
-Reescritura completa del v5. Cambios principales:
-  · **Tier 0 paralelo**: 4-6 hilos del 9b local + 2 hilos del 30b (sin contención
-    porque Ollama puede mantenerlos residentes con `OLLAMA_MAX_LOADED_MODELS>=2`).
-  · **Tier 1 filtro**: Minimax + Gemini Flash + Gemini Flash Lite + Haiku
-    (alta cuota, media concurrencia).
-  · **Tier 2 jueces**: Minimax + Codex + Gemini Pro + Sonnet (quorum 2/3).
+Phases A–D implementadas: pipeline correcto, VRAM local + fleet remoto,
+multi-nodo coordinado, TUI schema v2. Modelos locales (Ollama) + cloud (CLIs).
+
+Cambios respecto v6:
+  · **Tier 0 paralelo**: 4-6 hilos del 30b GPU + N hilos del 30b CPU + cloud chiquitos
+  · **Tier 1 filtro**: consenso/refutación Minimax + Gemini Flash + Haiku
+  · **Tier 2 jueces**: quorum 2/3 Minimax + Codex + Gemini Pro + Sonnet
   · **Tier 3 fixer**: Codex → Minimax → Gemini Pro → Sonnet → local 30b
-    (cadena con fallback; Opus NO se usa como fixer primario).
-  · **Tier 4 árbitro**: Sonnet → Minimax → Gemini Pro. **Opus SOLO si
-    (a) fix riesgoso, (b) los 3 discordaron o están en cuarentena,
-    (c) hay cuota Claude**. Banner de aviso cada vez.
-  · **Control de costos con `quota.py`**: antes de cada llamada, consulta
-    ai-usage-live. Si un modelo está cerca del límite, se omite de la cadena.
-  · **Memoria persistente con `memory.py`**: falsos positivos del 9b se
-    filtran entre sesiones; zonas endurecidas se re-escanean menos.
-  · **Reparación especulativa**: cuando 2+ jueces confirman, el fix se lanza
-    ANTES de que el siguiente sospechoso se confirme.
-  · **Hot-reload**: cada fix aplicado se valida (tsc+E2E) y se re-escanea
-    esa zona de inmediato.
-  · **Converge-and-stop**: si una pasada completa no produce fixes, el
-    código está estable y para (no quemar cómputo re-validando código limpio).
+  · **Fleet discovery**: GPUs locales + nodos remotos, VRAM-aware routing
+  · **Memory persistente**: falsos positivos filtrados entre sesiones
+  · **Gate E2E dirigido**: valida la ruta exacta del bug, no solo /
+  · **Cuarentena de salud**: modelos muertos o tóxicos quedan en espera
+  · **Consensus hunter**: 3 muestras, 2/3 acuerdan antes de emitir
 
 Aislamiento: worktree /tmp/demeter-loop (rama loop-nocturno). NO toca main
 ni producción. El MERGE lo aprueba el humano en la mañana.
@@ -40,11 +32,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import itertools
 import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -61,6 +53,9 @@ import memory
 import orchestrator
 import quota
 import tiers
+
+STATS_LOCK = threading.Lock()
+_ORCH_LOCK = threading.Lock()
 
 # Fleet de hardware (GPUs/nodos + planificación por VRAM). Poblado en main().
 FLEET = None
@@ -232,7 +227,9 @@ def _build_roles() -> list:
         'hunter': 'Hunters local', 'filter': 'Filtros', 'judge': 'Jueces',
         'fixer': 'Fixers', 'cloud': 'Cloud hunters',
     }
-    uptime = max(1, time.time() - STATS['started_at'])
+    with STATS_LOCK:
+        started_at = STATS['started_at']
+    uptime = max(1, time.time() - started_at)
     # Aggregate per-role stats from THREAD_STATES
     role_data: dict[str, dict] = {}
     q_set = set(quarantined_models())
@@ -392,33 +389,38 @@ def write_status() -> None:
             'age_sec': s.get('age_sec', 0),
             'idle_sec': s.get('idle_sec', 0),
         })
+    with STATS_LOCK:
+        stats_snapshot = dict(STATS)
+    with _ORCH_LOCK:
+        orch_prompts = list(_current_orch_prompts)
+        e2e_journeys = list(_current_e2e_journeys)
     payload = {
         'schema_version': 2,
         'ts': time.time(),
         'pid': os.getpid(),
-        'uptime_sec': int(time.time() - STATS['started_at']),
+        'uptime_sec': int(time.time() - stats_snapshot['started_at']),
         'funnel': {
-            'suspects_produced': STATS.get('suspects_produced', 0),
-            'suspects_refuted': STATS.get('suspects_refuted_by_filter', 0),
-            'suspects_known_fp': STATS.get('suspects_filtered_as_known_fp', 0),
-            'bugs_confirmed': STATS.get('bugs_confirmed', 0),
-            'fixes_attempted': STATS.get('fixes_attempted', 0),
-            'fixes_succeeded': STATS.get('fixes_succeeded', 0),
-            'fixes_reverted': STATS.get('fixes_reverted', 0),
-            'fixes_to_review': STATS.get('fixes_to_review', 0),
-            'e2e_findings': STATS.get('e2e_findings', 0),
-            'opus_invocations': STATS.get('opus_invocations', 0),
-            'rounds': STATS.get('rounds', 0),
-            'clean_rounds_in_a_row': STATS.get('clean_rounds_in_a_row', 0),
+            'suspects_produced': stats_snapshot.get('suspects_produced', 0),
+            'suspects_refuted': stats_snapshot.get('suspects_refuted_by_filter', 0),
+            'suspects_known_fp': stats_snapshot.get('suspects_filtered_as_known_fp', 0),
+            'bugs_confirmed': stats_snapshot.get('bugs_confirmed', 0),
+            'fixes_attempted': stats_snapshot.get('fixes_attempted', 0),
+            'fixes_succeeded': stats_snapshot.get('fixes_succeeded', 0),
+            'fixes_reverted': stats_snapshot.get('fixes_reverted', 0),
+            'fixes_to_review': stats_snapshot.get('fixes_to_review', 0),
+            'e2e_findings': stats_snapshot.get('e2e_findings', 0),
+            'opus_invocations': stats_snapshot.get('opus_invocations', 0),
+            'rounds': stats_snapshot.get('rounds', 0),
+            'clean_rounds_in_a_row': stats_snapshot.get('clean_rounds_in_a_row', 0),
         },
         'roles': _build_roles(),
         'threads': threads_v2,
         'orchestrator': {
             'model': orchestrator.ORCHESTRATOR_MODEL,
             # FIX crash TUI: int directo con sufijo _n (NO hacer len() sobre esto)
-            'hunting_prompts_n': len(_current_orch_prompts),
-            'e2e_journeys_n': len(_current_e2e_journeys) if _current_e2e_journeys else 0,
-            'ready': True,
+            'hunting_prompts_n': len(orch_prompts),
+            'e2e_journeys_n': len(e2e_journeys),
+            'ready': bool(orch_prompts),
         },
         'nodes': _build_nodes(),
         'quota': quota.local_spend(),
@@ -431,18 +433,18 @@ def write_status() -> None:
         },
         # Backward compat: keep 'stats' so existing stats tab in TUI still works
         'stats': {
-            'rounds': STATS.get('rounds', 0),
-            'clean_rounds_in_a_row': STATS.get('clean_rounds_in_a_row', 0),
-            'suspects_produced': STATS.get('suspects_produced', 0),
-            'suspects_refuted_by_filter': STATS.get('suspects_refuted_by_filter', 0),
-            'suspects_filtered_as_known_fp': STATS.get('suspects_filtered_as_known_fp', 0),
-            'bugs_confirmed': STATS.get('bugs_confirmed', 0),
-            'fixes_attempted': STATS.get('fixes_attempted', 0),
-            'fixes_succeeded': STATS.get('fixes_succeeded', 0),
-            'fixes_reverted': STATS.get('fixes_reverted', 0),
-            'fixes_to_review': STATS.get('fixes_to_review', 0),
-            'e2e_findings': STATS.get('e2e_findings', 0),
-            'opus_invocations': STATS.get('opus_invocations', 0),
+            'rounds': stats_snapshot.get('rounds', 0),
+            'clean_rounds_in_a_row': stats_snapshot.get('clean_rounds_in_a_row', 0),
+            'suspects_produced': stats_snapshot.get('suspects_produced', 0),
+            'suspects_refuted_by_filter': stats_snapshot.get('suspects_refuted_by_filter', 0),
+            'suspects_filtered_as_known_fp': stats_snapshot.get('suspects_filtered_as_known_fp', 0),
+            'bugs_confirmed': stats_snapshot.get('bugs_confirmed', 0),
+            'fixes_attempted': stats_snapshot.get('fixes_attempted', 0),
+            'fixes_succeeded': stats_snapshot.get('fixes_succeeded', 0),
+            'fixes_reverted': stats_snapshot.get('fixes_reverted', 0),
+            'fixes_to_review': stats_snapshot.get('fixes_to_review', 0),
+            'e2e_findings': stats_snapshot.get('e2e_findings', 0),
+            'opus_invocations': stats_snapshot.get('opus_invocations', 0),
         },
     }
     try:
@@ -506,7 +508,11 @@ def _mark_health(model_id: str, ok: bool) -> None:
         if ok:
             h['oks'] += 1
             h['fails'] = 0
-            h['quarantined_until'] = 0.0
+            # Un éxito limpia la racha, pero NO levanta una cuarentena ACTIVA
+            # (evita flapping: fail×3 → cuarentena → 1 probe con suerte → escapa).
+            # La cuarentena expira sola por tiempo.
+            if h['quarantined_until'] <= time.time():
+                h['quarantined_until'] = 0.0
         else:
             h['fails'] += 1
             if h['fails'] >= HEALTH_FAIL_THRESHOLD and h['quarantined_until'] <= time.time():
@@ -518,7 +524,15 @@ def _mark_health(model_id: str, ok: bool) -> None:
 def is_healthy(model_id: str) -> bool:
     with _HEALTH_LOCK:
         h = _HEALTH.get(model_id)
-        return not h or time.time() >= h.get('quarantined_until', 0.0)
+        if not h:
+            return True
+        now = time.time()
+        quarantine_until = h.get('quarantined_until', 0.0)
+        # Quarantine expired: reset counter for recovery
+        if now >= quarantine_until and quarantine_until > 0:
+            h['fails'] = 0
+            h['quarantined_until'] = 0.0
+        return now >= quarantine_until
 
 
 def quarantined_models() -> list[str]:
@@ -667,8 +681,8 @@ def _call_ollama(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: in
     model_name = spec.id.split(':', 1)[1]
     # Node-aware (Fase B/C): si el spec trae base_url/num_ctx/gpu_index (poblados
     # por el fleet), se usan; si no, defaults de entorno (comportamiento actual).
-    base = getattr(spec, 'base_url', None) or os.environ.get(
-        'LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+    base = getattr(spec, 'base_url', None) or (
+        os.environ.get('LOOP_OLLAMA_BASE') or 'http://host.docker.internal:11434')
     num_ctx = getattr(spec, 'num_ctx', None) or int(
         os.environ.get('LOOP_OLLAMA_NUM_CTX', '8192'))
     options = {'num_predict': max_tokens, 'temperature': 0.2, 'num_ctx': num_ctx}
@@ -983,7 +997,9 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
 
     log(f'  [hunter-{wid}] {hunter_spec.id} arrancando ({len(zone_files)} archivos'
         f'{", orquestador activo" if hunting_prompts else ""}, source={source_kind})')
+    node_name = getattr(hunter_spec, 'node', 'local')
     update_thread_state(f'hunter-{wid}', kind=('cloud' if is_cloud else 'hunter'),
+                        role='hunter', location=node_name, node=node_name,
                         model=hunter_spec.id,
                         status='busy', current_file='', calls=0)
     for file in zone_files:
@@ -999,10 +1015,13 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
 
         # Determinar si hay prompts de orquestador para este archivo.
         targeted = prompts_by_file.get(file, []) if hunting_prompts else []
-        update_thread_state(f'hunter-{wid}', current_file=file, status='busy',
+        update_thread_state(f'hunter-{wid}', role='hunter', location=node_name, node=node_name,
+                            current_file=file, status='busy',
                             current_task=f'revisando ({len(targeted)} pistas)' if targeted else 'revisando')
 
-        # Consenso: 3 muestras; solo emitimos si la mayoría coincide.
+        # Consenso: N muestras; solo emitimos si 2/3 coinciden en (file, line, snippet).
+        _consensus_collector = {}
+        required_votes = max(1, (2 * CONSENSUS_N + 2) // 3)
         for round_n in range(CONSENSUS_N):
             if targeted:
                 # PROMPT DIRIGIDO: el orquestador nos dice QUÉ buscar en este archivo.
@@ -1042,18 +1061,50 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                     continue
                 m = _parse_bug_line(line)
                 if m:
-                    yield_suspect(
-                        Suspect(
-                            file=m['file'],
-                            line=m['line'],
-                            snippet=m['snippet'],
-                            why=m['why'],
-                            severity=m.get('severity', 'medium'),
-                            repro=m.get('repro', ''),
-                            samples=1,
-                            source=source_kind,
-                        )
-                    )
+                    key = (m['file'], m['line'])
+                    entry = _consensus_collector.setdefault(key, {
+                        'rounds': {},
+                        'total_votes': {},
+                        'snippet': '',
+                        'why': '',
+                        'severity': m.get('severity', 'medium'),
+                        'repro': m.get('repro', ''),
+                    })
+                    snippet = (m.get('snippet') or '').strip()
+                    round_snippets = entry['rounds'].setdefault(round_n, [])
+                    if snippet not in round_snippets:
+                        round_snippets.append(snippet)
+                        entry['total_votes'][snippet] = entry['total_votes'].get(snippet, 0) + 1
+                    if len(snippet) > len(entry['snippet']):
+                        entry['snippet'] = snippet
+                    why = (m.get('why') or '').strip()
+                    if len(why) > len(entry['why']):
+                        entry['why'] = why
+                    if m.get('repro'):
+                        entry['repro'] = m['repro']
+                    entry['severity'] = m.get('severity', entry['severity'])
+        for (cons_file, cons_line), entry in _consensus_collector.items():
+            same_votes = max(entry['total_votes'].values(), default=0)
+            if same_votes < required_votes:
+                continue
+            snippets = [
+                snippet
+                for round_snippets in entry['rounds'].values()
+                for snippet in round_snippets
+            ]
+            combined_snippet = max(snippets, key=len, default=entry['snippet'])
+            yield_suspect(
+                Suspect(
+                    file=cons_file,
+                    line=cons_line,
+                    snippet=combined_snippet,
+                    why=entry['why'],
+                    severity=entry['severity'],
+                    repro=entry['repro'],
+                    samples=same_votes,
+                    source=source_kind,
+                )
+            )
         log(f'  [hunter-{wid}] {file} revisado')
         update_thread_state(f'hunter-{wid}', calls=THREAD_STATES.get(f'hunter-{wid}', {}).get('calls', 0) + 1)
 
@@ -1073,20 +1124,21 @@ def yield_suspect(s: Suspect) -> None:
     # Anti-fantasmas: descartar suspects cuyo archivo no existe en el worktree.
     # El parser viejo producía paths basura (`fecha`, snippets como path) que
     # llegaban hasta el fixer y gastaban jueces antes de abortar. Los hallazgos
-    # E2E usan una URL de ruta (no un path de fichero), así que se exceptúan.
+    # E2E se mapean a archivo real antes de entrar aquí.
     s.file = (s.file or '').strip().lstrip('`').lstrip('./')
-    if s.source != 'e2e':
-        if not s.file or not (WT_SUBDIR / s.file).is_file():
-            log(f'  [yield] descartado fantasma {s.file!r}:{s.line}')
-            return
+    if not s.file or not (WT_SUBDIR / s.file).is_file():
+        log(f'  [yield] descartado fantasma {s.file!r}:{s.line}')
+        return
 
     if MEM.should_skip(s.file, s.line, s.snippet):
-        STATS['suspects_filtered_as_known_fp'] += 1
+        with STATS_LOCK:
+            STATS['suspects_filtered_as_known_fp'] += 1
         return
     if MEM.get_bug(s.file, s.line, s.snippet) and MEM.get_bug(s.file, s.line, s.snippet).fixed:
         return
 
-    STATS['suspects_produced'] += 1
+    with STATS_LOCK:
+        STATS['suspects_produced'] += 1
     if s.source == 'cloud':
         # Cloud hunter: a jueces directo (más preciso).
         try:
@@ -1165,7 +1217,8 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
         ordered = [filters[(offset + i) % n] for i in range(min(FILTER_QUORUM + 1, n))]
         offset = (offset + 1) % n
 
-        update_thread_state(f'filter-{wid}', current_file=s.file, status='busy',
+        update_thread_state(f'filter-{wid}', role='filter', location='cloud', node='cloud',
+                            current_file=s.file, status='busy',
                             current_task=f'consenso {len(ordered)} modelos')
 
         # CONSENSO NO-BLOQUEANTE: disparar todos los modelos en paralelo.
@@ -1201,8 +1254,8 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
 
         # Contar votos (excluyendo fallos).
         valid_votes = [v for v in votes if v[0] != 'FAIL']
-        if len(valid_votes) < 2:
-            # Menos de 2 votos válidos: skip silencioso (cuota agotada o modelos caídos)
+        if len(valid_votes) < FILTER_QUORUM:
+            # Menos de FILTER_QUORUM votos válidos: skip silencioso.
             update_thread_state(f'filter-{wid}', current_file='', status='idle', current_task='')
             suspectq.task_done()
             continue
@@ -1212,7 +1265,7 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
         unclear_count = sum(1 for v in valid_votes if v[0] == 'UNCLEAR')
         specs_used_str = ','.join(s.split('/')[-1][:20] for s in specs_used[:FILTER_QUORUM])
 
-        if real_count >= 2 or (real_count >= 1 and notbug_count == 0 and unclear_count == 0):
+        if real_count >= FILTER_QUORUM:
             # Quorum a favor de REAL: pasa a bugq (jueces lo confirmarán en tier 2).
             try:
                 bugq.put_nowait(Bug(suspect=s))
@@ -1220,11 +1273,12 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
                     f'{s.file}:{s.line} ({specs_used_str})')
             except queue.Full:
                 pass
-        elif notbug_count >= 2 or (notbug_count >= 1 and real_count == 0 and unclear_count == 0):
+        elif notbug_count >= FILTER_QUORUM:
             # Quorum a favor de NOT_A_BUG: refutado.
             MEM.record_false_positive(s.file, s.line, s.snippet,
                                       reason=f'consenso {specs_used_str}')
-            STATS['suspects_refuted_by_filter'] += 1
+            with STATS_LOCK:
+                STATS['suspects_refuted_by_filter'] += 1
             log(f'  [filter-{wid}] NOT_A_BUG [{real_count}R/{notbug_count}N/{unclear_count}U] '
                 f'{s.file}:{s.line} ({specs_used_str})')
         else:
@@ -1236,7 +1290,8 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
                 log(f'  [filter-{wid}] DISCORD [{real_count}R/{notbug_count}N/{unclear_count}U] '
                     f'{s.file}:{s.line} → escalado a juez ({specs_used_str})')
                 bugq.put_nowait(b)
-                STATS['suspects_filtered_as_known_fp'] += 0  # no es FP
+                with STATS_LOCK:
+                    STATS['suspects_filtered_as_known_fp'] += 0  # no es FP
             except queue.Full:
                 pass
 
@@ -1289,7 +1344,8 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
             f'Razón original: {bug.suspect.why}\n\n'
             '¿Es REAL, NOT_A_BUG, o WONT_FIX?'
         )
-        update_thread_state(f'judge-{wid}', current_file=bug.suspect.file,
+        update_thread_state(f'judge-{wid}', role='judge', location='cloud', node='cloud',
+                            current_file=bug.suspect.file,
                             status='busy', current_task=f'juzgando {len(judges)} modelos')
 
         # TAMBIÉN paralelo: lanzar todos los jueces en paralelo.
@@ -1321,7 +1377,8 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
 
         # Quorum.
         if bug.votes_real >= JUDGE_MIN and bug.votes_real > bug.votes_not_bug:
-            STATS['bugs_confirmed'] += 1
+            with STATS_LOCK:
+                STATS['bugs_confirmed'] += 1
             log(f'  [judge-{wid}] CONFIRMED {bug.suspect.file}:{bug.suspect.line} '
                 f'({bug.votes_real}/{len(bug.voters)} REAL, sev={bug.suspect.severity})')
             # Compuerta de auto-fix agresivo: solo auto-arreglamos SIN revisión humana
@@ -1331,12 +1388,13 @@ def judge_worker(judges: list[tiers.ModelSpec], wid: int) -> None:
             unanimous = (bug.votes_not_bug == 0 and bug.votes_real == len(bug.voters)
                          and bug.votes_real >= JUDGE_MIN)
             high_sev = bug.suspect.severity in ('high', 'critical')
-            if os.environ.get('LOOP_AUTOFIX_ALL', '0') == '1' or high_sev or unanimous:
+            if (os.environ.get('LOOP_AUTOFIX_ALL', '0') == '1' or high_sev or unanimous) and not args.dry_run:
                 threading.Thread(
                     target=fixer_worker, args=(bug,), daemon=True, name=f'fixer-{wid}'
                 ).start()
             else:
-                STATS['fixes_to_review'] += 1
+                with STATS_LOCK:
+                    STATS['fixes_to_review'] += 1
                 _add_to_review(bug.suspect, '', 'judge-confirmed-no-autofix')
                 log(f'  [judge-{wid}] {bug.suspect.file}:{bug.suspect.line} confirmado '
                     f'(sev={bug.suspect.severity}, {bug.votes_real}R/{bug.votes_not_bug}N) '
@@ -1382,7 +1440,8 @@ def fixer_worker(bug: Bug) -> None:
         return
     try:
         log(f'  [fixer] {bug.suspect.file}:{bug.suspect.line} arrancando')
-        STATS['fixes_attempted'] += 1
+        with STATS_LOCK:
+            STATS['fixes_attempted'] += 1
         update_thread_state(f'fixer-{bug.suspect.file}', kind='fixer',
                             model='?', status='busy',
                             current_file=bug.suspect.file, calls=1)
@@ -1414,6 +1473,10 @@ def fixer_worker(bug: Bug) -> None:
                 'corregido, sin explicaciones. Si el fix requiere más de 200 líneas, '
                 'describe solo el cambio y devuélvelo en un patch (diff unificado).'
             )
+            # Update thread state con spec actual
+            node_name = getattr(spec, 'node', 'local')
+            update_thread_state(f'fixer-{bug.suspect.file}', model=spec.id,
+                                role='fixer', location=node_name, node=node_name)
             # El fixer LOCAL (30B GPU) necesita timeout amplio (fix real ~123s)
             # y menos tokens para no excederse; el cloud usa los defaults.
             is_local = spec.id.startswith('ollama:')
@@ -1434,15 +1497,27 @@ def fixer_worker(bug: Bug) -> None:
             if not cleaned.strip() or cleaned.strip() == original.strip():
                 continue
 
+            # Dry-run: log sin aplicar.
+            if args.dry_run:
+                log(f'  [fixer] DRY-RUN {bug.suspect.file}:{bug.suspect.line} '
+                    f'({spec.id}) — resultado:\n{cleaned[:500]}...')
+                with STATS_LOCK:
+                    STATS['fixes_succeeded'] += 1
+                MEM.record_bug(bug.suspect.file, bug.suspect.line,
+                               bug.suspect.snippet, fix_commit='DRY-RUN')
+                continue
+
             # Aplicar y validar.
             if _apply_and_validate(path, cleaned, bug.suspect):
-                STATS['fixes_succeeded'] += 1
                 commit = _commit_fix(path, bug.suspect)
                 if commit:
+                    with STATS_LOCK:
+                        STATS['fixes_succeeded'] += 1
                     MEM.record_bug(bug.suspect.file, bug.suspect.line,
                                    bug.suspect.snippet, fix_commit=commit)
                     if _is_risky(bug.suspect):
-                        STATS['fixes_to_review'] += 1
+                        with STATS_LOCK:
+                            STATS['fixes_to_review'] += 1
                         _add_to_review(bug.suspect, commit, spec.id)
                     log(f'  [fixer] OK {bug.suspect.file}:{bug.suspect.line} '
                         f'({spec.id} → {commit[:7]})')
@@ -1466,7 +1541,10 @@ def fixer_worker(bug: Bug) -> None:
 
 def _looks_like_patch(text: str) -> bool:
     t = text.lstrip()
-    return t.startswith(('--- ', 'diff ', '@@ ')) or '\n@@ ' in text
+    # Patch real: empieza con cabecera de diff, o contiene cabeceras --- Y +++ Y @@.
+    # (un '@@' suelto en medio de código NO es un patch.)
+    return (t.startswith(('--- ', 'diff ', '@@ '))
+            or ('--- ' in text and '+++ ' in text and '@@' in text))
 
 
 def _patch_files(diff_text: str) -> set:
@@ -1492,6 +1570,31 @@ def _apply_patch(diff_text: str) -> bool:
         return False
 
 
+def _revert_patch(diff_text: str) -> bool:
+    """Revierte un patch aplicado con git apply -R."""
+    try:
+        r = subprocess.run(['git', 'apply', '-R', '--3way', '--whitespace=nowarn', '-'],
+                           input=diff_text, cwd=str(WT), capture_output=True,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            log(f'  [fix] git apply -R falló: {(r.stderr or "")[:160]}')
+        return r.returncode == 0
+    except Exception as e:
+        log(f'  [fix] git apply -R excepción: {e}')
+        return False
+
+
+def _patch_files(diff_text: str) -> set:
+    """Extrae los archivos tocados por un diff unificado."""
+    files = set()
+    for ln in diff_text.splitlines():
+        if ln.startswith(('+++ ', '--- ')):
+            p = ln[4:].split('\t', 1)[0].strip()
+            if p and p != '/dev/null':
+                files.add(re.sub(r'^[ab]/', '', p))
+    return files
+
+
 def _apply_and_validate(path: Path, new_content: str, suspect: Suspect) -> bool:
     """Aplica el cambio (archivo completo o patch unificado), corre tsc + E2E
     DIRIGIDO a la ruta del bug; revierte si falla. El caller (fixer_worker)
@@ -1503,6 +1606,14 @@ def _apply_and_validate(path: Path, new_content: str, suspect: Suspect) -> bool:
             log(f'  [fix] patch multi-archivo rechazado: {sorted(touched)}')
             return False
         if not _apply_patch(new_content):
+            return False
+        # Verificar que el patch toca suspect.file
+        expected = {suspect.file}
+        if SUBDIR not in ('', '.'):
+            expected.add(str(Path(SUBDIR) / suspect.file))
+        if not (touched & expected):
+            log(f'  [fix] patch no toca {suspect.file}; patch cubre {sorted(touched)}')
+            _revert_patch(new_content)
             return False
     else:
         try:
@@ -1537,6 +1648,8 @@ def _run_tsc() -> bool:
 
 def _route_for_file(file_path: str) -> Optional[str]:
     """Deriva la ruta URL del módulo afectado a partir del path del archivo."""
+    if not file_path:
+        return None
     m = re.search(r'app/\(panel\)/([^/]+)/', file_path)
     if m:
         return '/' + m.group(1)
@@ -1578,7 +1691,7 @@ def _run_e2e_route(route: str, max_actions: int = 12, budget_ms: int = 45000,
         log(f'  [fix] E2E fatal ({route}): {str(out.get("fatal"))[:120]}')
         return (False, [])
     fatal = [er for er in out.get('errors', [])
-             if er.get('kind') in ('http', 'pageerror', 'errorUI')]
+             if er.get('kind') in ('http', 'pageerror', 'errorUI', 'console')]
     return (True, fatal)
 
 
@@ -1590,7 +1703,11 @@ def _run_smoke_subset(file_path: str) -> bool:
     Modo estricto (LOOP_GATE_REQUIRE_E2E=1): bloquea el commit si el E2E no corre.
     """
     strict = os.environ.get('LOOP_GATE_REQUIRE_E2E', '0') == '1'
-    if not _dev_server_up():
+    try:
+        server_up = _dev_server_up()
+    except Exception:
+        server_up = False
+    if not server_up:
         if strict:
             log('  [fix] gate estricto: dev server caído → NO commitear')
             return False
@@ -1668,6 +1785,23 @@ def _add_to_review(suspect: Suspect, commit: str, model: str) -> None:
 # E2E Sweep (Playwright en paralelo con el code hunter).
 # ---------------------------------------------------------------------------
 
+def _map_e2e_route_to_file(route: str) -> Optional[str]:
+    """Mapea ruta E2E (p.ej. '/clientes') a archivo en worktree."""
+    route = route.strip('/').lower()
+    if not route:
+        return 'app/page.tsx'
+    candidates = [
+        f'app/(panel)/{route}/page.tsx',
+        f'app/{route}/page.tsx',
+        f'pages/{route}.tsx',
+        f'pages/{route}/index.tsx',
+    ]
+    for cand in candidates:
+        if (WT_SUBDIR / cand).exists():
+            return cand
+    log(f'    [e2e-map] {route} → no encontrado en {candidates}')
+    return None
+
 def e2e_sweep_worker(zone: str) -> None:
     """Corre el crawler E2E contra una zona y emite suspectq con hallazgos.
 
@@ -1709,16 +1843,22 @@ def e2e_sweep_worker(zone: str) -> None:
         return
     errors = out.get('errors', [])
     for err in errors:
-        STATS['e2e_findings'] += 1
+        with STATS_LOCK:
+            STATS['e2e_findings'] += 1
         kind = err.get('kind', '?')
         where = err.get('where', route)
         detail = str(err.get('detail', ''))
+        e2e_route = out.get('route', route)
+        mapped_file = _map_e2e_route_to_file(e2e_route)
+        if not mapped_file:
+            log(f'    [e2e] route {e2e_route} no mapeada a archivo; skip')
+            continue
         yield_suspect(Suspect(
-            file=out.get('route', route),
+            file=mapped_file,
             line=0,
             snippet=detail[:100],
             why=f'E2E {kind}@{where}: {detail[:120]}',
-            severity='high' if kind in ('http', 'pageerror', 'errorUI') else 'medium',
+            severity='high',
             source='e2e',
         ))
     log(f'  [e2e-sweep] {route}: {len(errors)} hallazgos')
@@ -1735,12 +1875,16 @@ def watchdog() -> None:
     """Si no hay avance en N segundos, libera modelos pesados (Ollama unload)
     y avisa al usuario."""
     last_progress = time.time()
-    last_round = STATS['rounds']
+    with STATS_LOCK:
+        last_round = STATS['rounds']
     while not shutdown.is_set():
         time.sleep(30)
-        if STATS['rounds'] > last_round or STATS['fixes_succeeded'] > 0:
+        with STATS_LOCK:
+            current_round = STATS['rounds']
+            fixes_succeeded = STATS['fixes_succeeded']
+        if current_round > last_round or fixes_succeeded > 0:
             last_progress = time.time()
-            last_round = STATS['rounds']
+            last_round = current_round
         elif time.time() - last_progress > STALL_SECS:
             log(f'  [watchdog] stall {STALL_SECS}s sin avance; descargando Ollama')
             try:
@@ -1750,7 +1894,15 @@ def watchdog() -> None:
                     unload = [(getattr(s, 'base_url', None) or default_base, s.id.split(':', 1)[1])
                               for s in FLEET.all_specs()]
                 else:
-                    unload = [(default_base, 'qwen3-coder:30b'), (default_base, 'qwen3.5:9b')]
+                    # Fallback: usar modelos de TIER0_HUNTERS actuales
+                    model_names = list({
+                        spec.id.split(':', 1)[1]
+                        for spec in tiers.TIER0_HUNTERS
+                        if spec.id.startswith('ollama:')
+                    })
+                    if not model_names:
+                        model_names = ['qwen3-coder:30b']
+                    unload = [(default_base, m) for m in model_names]
                 for base, model_name in unload:
                     try:
                         req = urllib.request.Request(
@@ -1822,6 +1974,7 @@ def discover_code_zones() -> list[list[str]]:
 
 
 def main() -> None:
+    global args
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-e2e', action='store_true', help='skip E2E sweep')
     parser.add_argument('--dry-run', action='store_true', help='no aplicar fixes')
@@ -1872,7 +2025,7 @@ def main() -> None:
     # Fleet: descubre GPUs/nodos y planifica el modelo por VRAM (Fase B/C). Los
     # hunters locales y el fixer local salen del fleet (incl. la RTX 2060 antes
     # ociosa). Health-loop en daemon escribe /tmp/harness-fleet.json para la TUI.
-    global FLEET
+    global FLEET, _current_orch_prompts, _current_e2e_journeys
     FLEET = fleet.build_fleet()
     fleet.write_fleet_status(FLEET)
     fleet.start_health_loop(FLEET, shutdown)
@@ -1945,7 +2098,8 @@ def main() -> None:
     hunting_prompts = orchestrator.generate_hunting_prompts(
         str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
     )
-    _current_orch_prompts = hunting_prompts or []
+    with _ORCH_LOCK:
+        _current_orch_prompts = hunting_prompts or []
     if hunting_prompts:
         log(f'  [main] Orquestador: {len(hunting_prompts)} prompts dirigidos generados')
         # Log de muestra: primeros 3 prompts
@@ -1959,7 +2113,8 @@ def main() -> None:
                 str(WT), SUBDIR, cache_path='/tmp/orch-prompts.json'
             )
             if e2e_journeys:
-                _current_e2e_journeys = e2e_journeys
+                with _ORCH_LOCK:
+                    _current_e2e_journeys = e2e_journeys
                 log(f'  [main] Orquestador: {len(e2e_journeys)} journeys E2E generados')
     else:
         log('  [main] Orquestador no generó prompts (cache o fallback heurístico)')
@@ -1969,42 +2124,60 @@ def main() -> None:
     # Watchdog.
     threading.Thread(target=watchdog, daemon=True, name='watchdog').start()
 
+    # Thread registry para shutdown ordenado
+    worker_threads = []
+
     # Arranque de workers tier 0.
+    total_hunter_workers = HUNTER_HILOS + SECOND_HILOS + CLOUD_HUNTER_HILOS
+    zone_for_wid = {wid: [] for wid in range(total_hunter_workers)}
+    worker_cycle = itertools.cycle(range(total_hunter_workers))
+    for zone in code_zones:
+        zone_for_wid[next(worker_cycle)].extend(zone)
+    if len(code_zones) < total_hunter_workers:
+        zone_cycle = itertools.cycle(code_zones)
+        for wid in range(total_hunter_workers):
+            if not zone_for_wid[wid]:
+                zone_for_wid[wid].extend(next(zone_cycle))
     hunter_threads = []
     for i in range(HUNTER_HILOS):
         t = threading.Thread(
             target=hunter_worker,
-            args=(code_zones[i % len(code_zones)], hunter_specs[i % len(hunter_specs)], i),
+            args=(zone_for_wid[i], hunter_specs[i % len(hunter_specs)], i),
             kwargs={'hunting_prompts': hunting_prompts},
             daemon=True,
             name=f'hunter-{i}',
         )
         t.start()
         hunter_threads.append(t)
+        worker_threads.append(t)
 
     second_threads = []
     for i in range(SECOND_HILOS):
+        global_wid = HUNTER_HILOS + i
         t = threading.Thread(
             target=hunter_worker,
-            args=(code_zones[(i + HUNTER_HILOS) % len(code_zones)], second_specs[i % len(second_specs)], i),
+            args=(zone_for_wid[global_wid], second_specs[i % len(second_specs)], i),
             kwargs={'hunting_prompts': hunting_prompts},
             daemon=True,
             name=f'second-{i}',
         )
         t.start()
         second_threads.append(t)
+        worker_threads.append(t)
 
     # Arranque de workers tier 0 CLOUD (modelos chiquitos baratos).
     for i in range(CLOUD_HUNTER_HILOS):
+        global_wid = HUNTER_HILOS + SECOND_HILOS + i
         t = threading.Thread(
             target=hunter_worker,
-            args=(code_zones[(i + HUNTER_HILOS + SECOND_HILOS) % len(code_zones)],
+            args=(zone_for_wid[global_wid],
                   cloud_hunter_specs[i % len(cloud_hunter_specs)], i),
             kwargs={'hunting_prompts': hunting_prompts},
             daemon=True,
             name=f'cloud-{i}',
         )
         t.start()
+        worker_threads.append(t)
 
     # Arranque de workers tier 1 (filtros).
     for i in range(FILTER_HILOS):
@@ -2015,6 +2188,7 @@ def main() -> None:
             name=f'filter-{i}',
         )
         t.start()
+        worker_threads.append(t)
 
     # Arranque de workers tier 2 (jueces).
     for i in range(JUDGE_HILOS):
@@ -2025,13 +2199,16 @@ def main() -> None:
             name=f'judge-{i}',
         )
         t.start()
+        worker_threads.append(t)
 
     # E2E sweep (en paralelo con code hunting).
     if not args.no_e2e:
         for zone in discover_zones()[:5]:  # limita a 5 zonas
-            threading.Thread(
+            t = threading.Thread(
                 target=e2e_sweep_worker, args=(zone,), daemon=True, name=f'e2e-{zone}'
-            ).start()
+            )
+            t.start()
+            worker_threads.append(t)
 
     # Main loop: converge-and-stop. NO termina el run prematuramente;
     # solo avisa cuando hay N rondas limpias (el código está estable). El run
@@ -2041,22 +2218,26 @@ def main() -> None:
     try:
         while time.time() < deadline:
             time.sleep(15)
-            STATS['rounds'] += 1
-            if STATS['fixes_succeeded'] > 0 or STATS['e2e_findings'] > 0:
-                STATS['clean_rounds_in_a_row'] = 0
-            else:
-                STATS['clean_rounds_in_a_row'] += 1
+            with STATS_LOCK:
+                STATS['rounds'] += 1
+                if STATS['fixes_succeeded'] > 0 or STATS['e2e_findings'] > 0:
+                    STATS['clean_rounds_in_a_row'] = 0
+                else:
+                    STATS['clean_rounds_in_a_row'] += 1
+                current_rounds = STATS['rounds']
+                clean_rounds = STATS['clean_rounds_in_a_row']
+                fixes_succeeded = STATS['fixes_succeeded']
 
             if time.time() - last_status > 60:
                 last_status = time.time()
-                log(f'  [main] round={STATS["rounds"]} clean={STATS["clean_rounds_in_a_row"]} '
+                log(f'  [main] round={current_rounds} clean={clean_rounds} '
                     f'suspectq={suspectq.qsize()} bugq={bugq.qsize()} '
-                    f'fixes={STATS["fixes_succeeded"]}')
+                    f'fixes={fixes_succeeded}')
                 write_status()
 
-            if STATS['clean_rounds_in_a_row'] >= TARGET:
+            if clean_rounds >= TARGET:
                 # NO break — solo avisamos. El run sigue hasta `deadline`.
-                log(f'  [main] converge-adv: {STATS["clean_rounds_in_a_row"]} rondas '
+                log(f'  [main] converge-adv: {clean_rounds} rondas '
                     f'limpias (target={TARGET}), código estable. Continuando '
                     f'hasta deadline ({int((deadline-time.time())/60)}m restantes).')
     except KeyboardInterrupt:
@@ -2064,8 +2245,15 @@ def main() -> None:
 
     shutdown.set()
     write_status()
-    log('  [main] Memorias guardadas, run terminado')
+    log(f'  [main] shutdown @ round {STATS["rounds"]}')
+    log('  [main] aguardando workers...')
+    for t in worker_threads:
+        t.join(timeout=5.0)
+    with STATS_LOCK:
+        final_round = STATS['rounds']
+    log(f'  [main] {len([t for t in worker_threads if t.is_alive()])} workers aún corriendo')
     MEM.save()
+    log('  [main] Memorias guardadas, run terminado')
 
     log(quota.report())
     log(MEM.summary())

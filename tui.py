@@ -154,6 +154,10 @@ class LogBuffer:
         self._cursor = 0  # posición en el buffer para scroll
         self._last_size = 0
 
+    def append_msg(self, msg: str) -> None:
+        """Agrega un mensaje interno de la TUI al log con su timestamp."""
+        self.lines.append((time.time(), msg))
+
     def update(self, path: str) -> bool:
         """Lee el archivo y agrega las líneas nuevas. Retorna True si hubo cambios."""
         try:
@@ -273,6 +277,24 @@ def _safe_int(val, default: int = 0) -> int:
     try:
         return int(val)
     except (TypeError, ValueError):
+        return default
+
+
+def _read_harness_pid() -> int:
+    """Reads the harness PID safely, returning 0 if missing or invalid."""
+    try:
+        with open(HARNESS_PID_FILE, 'r') as f:
+            content = f.read().strip()
+            return int(content) if content else 0
+    except (FileNotFoundError, ValueError, OSError):
+        return 0
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Convierte val a float de forma segura. Nunca falla con TypeError."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
         return default
 
 
@@ -593,19 +615,9 @@ def draw_header(stdscr, status: dict, harness_alive: bool, y: int = 0) -> int:
     opus = _safe_int(f.get('opus_invocations', 0))
     opus_color = COLOR_PAIR_MAGENTA if opus > 0 else COLOR_PAIR_DEFAULT
     try:
-        line2 = "  Bugs: "
-        stdscr.addstr(y, 1, line2, curses.color_pair(COLOR_PAIR_DEFAULT))
-        stdscr.addstr(y, 1 + len(line2), f"{bugs} confirm",
-                     curses.color_pair(bug_color) | curses.A_BOLD)
-        pos = 1 + len(line2) + len(f"{bugs} confirm")
-        stdscr.addstr(y, pos, "  |  FixOK: ", curses.color_pair(COLOR_PAIR_DEFAULT))
-        pos += len("  |  FixOK: ")
         fixes_str = f"{fixes}/{f.get('fixes_attempted', 0)} att"
-        stdscr.addstr(y, pos, fixes_str, curses.color_pair(fix_color) | curses.A_BOLD)
-        pos += len(fixes_str)
-        stdscr.addstr(y, pos, "  |  Opus: ", curses.color_pair(COLOR_PAIR_DEFAULT))
-        pos += len("  |  Opus: ")
-        stdscr.addstr(y, pos, str(opus), curses.color_pair(opus_color) | curses.A_BOLD)
+        line2 = f"  Bugs: {bugs} confirm  |  FixOK: {fixes_str}  |  Opus: {opus}"
+        stdscr.addstr(y, 1, line2[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
     except curses.error:
         pass
     y += 1
@@ -675,17 +687,21 @@ def draw_system_panel(stdscr, cpu: dict, gpus: list, ollama: list, y: int) -> in
     # GPUs.
     for gpu in gpus:
         mem_pct = (gpu['mem_used_mib'] / gpu['mem_total_mib'] * 100) if gpu['mem_total_mib'] else 0
-        util_color = COLOR_PAIR_GREEN if gpu['util_pct'] < 50 else (
-            COLOR_PAIR_YELLOW if gpu['util_pct'] < 80 else COLOR_PAIR_RED)
         mem_color = COLOR_PAIR_GREEN if mem_pct < 60 else (
             COLOR_PAIR_YELLOW if mem_pct < 85 else COLOR_PAIR_RED)
-        stdscr.addstr(y, 1, f"  GPU {gpu['index']} {gpu['name'][:18]:18s} ", curses.color_pair(COLOR_PAIR_DEFAULT))
-        stdscr.addstr(y, 32, f"util={gpu['util_pct']:>3d}%  ", curses.color_pair(util_color) | curses.A_BOLD)
-        stdscr.addstr(y, 46, f"vram {gpu['mem_used_mib']:>5d}MiB / {gpu['mem_total_mib']:>5d}MiB  ",
-                     curses.color_pair(mem_color))
+
         bar_len = int(mem_pct / 100 * 15)
         bar = '█' * bar_len + '·' * (15 - bar_len)
-        stdscr.addstr(y, 78, bar, mem_color)
+
+        # Construir la línea completa sin depender de columnas fijas
+        line = f"  GPU {gpu['index']} {gpu['name'][:18]:18s} util={gpu['util_pct']:>3d}%  vram {gpu['mem_used_mib']:>5d}MiB / {gpu['mem_total_mib']:>5d}MiB  {bar}"
+
+        # Truncar a w-2 y realizar un único addstr
+        try:
+            stdscr.addstr(y, 1, line[:w-2], curses.color_pair(mem_color))
+        except curses.error:
+            pass
+
         y += 1
         if y >= h - 2:
             break
@@ -815,7 +831,7 @@ def draw_process_containers(stdscr, status: dict, y: int) -> int:
 
     grouped: dict[str, list[dict]] = {}
     for t in threads:
-        grouped.setdefault(t.get('kind', '?'), []).append(t)
+        grouped.setdefault(t.get('role') or t.get('kind', '?'), []).append(t)
 
     for cat_key, label, _ in ORDER:
         agents = grouped.get(cat_key, [])
@@ -990,7 +1006,7 @@ def draw_pipeline_panel(stdscr, status: dict, y: int) -> int:
         busy_n = _safe_int(role_entry.get('busy_n', 0))
         quar_n = _safe_int(role_entry.get('quarantined_n', 0))
         calls = _safe_int(role_entry.get('calls_total', 0))
-        cpm = role_entry.get('calls_per_min', 0.0)
+        cpm = _safe_float(role_entry.get('calls_per_min', 0.0), 0.0)
         to_n = _safe_int(role_entry.get('timeouts', 0))
         role_line = (f' [{icon}] {label:<14s}  live {live_n}/{conf_n}'
                      f'  busy:{busy_n}  q:{quar_n}  {calls}c  {cpm:.1f}/min  to:{to_n}')
@@ -1134,7 +1150,7 @@ def main(stdscr):
     last_gpus = []
     last_ollama = []
     last_counts: Counter = Counter()
-    harness_pid = int(open(HARNESS_PID_FILE).read().strip()) if os.path.exists(HARNESS_PID_FILE) else 0
+    harness_pid = _read_harness_pid()
 
     paused = False
     current_tab = 'dashboard'  # 'dashboard' | 'models' | 'logs' | 'stats'
@@ -1146,14 +1162,15 @@ def main(stdscr):
     # --- helpers TUI ---
     def _stop_harness():
         """Mata el harness si está corriendo."""
-        if os.path.exists(HARNESS_PID_FILE):
+        pid = _read_harness_pid()
+        if pid:
             try:
-                pid = int(open(HARNESS_PID_FILE).read().strip())
                 os.kill(pid, 15)  # SIGTERM
                 time.sleep(0.5)
                 if check_alive(pid):
                     os.kill(pid, 9)  # SIGKILL
-                os.remove(HARNESS_PID_FILE)
+                if os.path.exists(HARNESS_PID_FILE):
+                    os.remove(HARNESS_PID_FILE)
             except (OSError, ValueError):
                 pass
 
@@ -1161,24 +1178,36 @@ def main(stdscr):
                         hours: int = 8, dev_url: str = ''):
         """Lanza el harness en background con nohup."""
         env = os.environ.copy()
+
+        # Respetar variables de entorno como fallback si se pasan los valores por defecto
+        if wt_dir == '/tmp/wt-night':
+            wt_dir = env.get('LOOP_WT', wt_dir)
+        if subdir == 'apps/dashboard':
+            subdir = env.get('LOOP_SUBDIR', subdir)
+
         env['LOOP_WT'] = wt_dir
         env['LOOP_SUBDIR'] = subdir
         env['LOOP_HOURS'] = str(hours)
         if dev_url:
             env['LOOP_DEV_URL'] = dev_url
+
         harness_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'harness.py')
-        cmd = ['nohup', 'python3', '-u', harness_py,
-               '--no-e2e',  # por ahora sin E2E (se puede cambiar)
-               ]
+        cmd = ['nohup', 'python3', '-u', harness_py]
+        if env.get('LOOP_E2E', '').lower() == 'true':
+            cmd.append('--e2e')
+        else:
+            cmd.append('--no-e2e')
+
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=open(LOG_FILE, 'a'),  # append al log
-                stderr=subprocess.STDOUT,
-                env=env,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                preexec_fn=os.setpgrp,  # grupo propio para no heredar CTRL+C
-            )
+            with open(LOG_FILE, 'a') as log_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    preexec_fn=os.setpgrp,  # grupo propio para no heredar CTRL+C
+                )
             with open(HARNESS_PID_FILE, 'w') as f:
                 f.write(str(proc.pid))
             return proc.pid
@@ -1273,28 +1302,28 @@ def main(stdscr):
         elif key in (ord('s'), ord('S')):
             # Toggle: si está corriendo → parar; si no → lanzar.
             if harness_pid and check_alive(harness_pid):
-                log.lines.append(f'[TUI] deteniendo harness (PID {harness_pid})...')
+                log.append_msg(f'[TUI] deteniendo harness (PID {harness_pid})...')
                 _stop_harness()
                 harness_pid = 0
                 cycle_launched = False
-                log.lines.append('[TUI] harness detenido.')
+                log.append_msg('[TUI] harness detenido.')
             else:
-                log.lines.append(f'[TUI] lanzando ciclo del harness ({cycle_duration}h '
+                log.append_msg(f'[TUI] lanzando ciclo del harness ({cycle_duration}h '
                                  f'en /tmp/wt-night/apps/dashboard)...')
                 pid = _launch_harness(hours=cycle_duration)
                 if pid:
                     harness_pid = pid
                     cycle_launched = True
-                    log.lines.append(f'[TUI] harness lanzado con PID {pid}, duración {cycle_duration}h')
+                    log.append_msg(f'[TUI] harness lanzado con PID {pid}, duración {cycle_duration}h')
                 else:
-                    log.lines.append('[TUI] ERROR: no se pudo lanzar el harness.')
+                    log.append_msg('[TUI] ERROR: no se pudo lanzar el harness.')
             last_refresh = 0
         elif key in (ord('d'), ord('D')):
             # Menú de selección de duración.
             curses.curs_set(1)
             cycle_duration = _show_duration_menu(stdscr, cycle_duration)
             curses.curs_set(0)
-            log.lines.append(f'[TUI] duración del ciclo: {cycle_duration}h '
+            log.append_msg(f'[TUI] duración del ciclo: {cycle_duration}h '
                              f'{"(indefinido)" if cycle_duration == 0 else ""}')
             stdscr.clear()
             last_refresh = 0
@@ -1302,7 +1331,7 @@ def main(stdscr):
             # Configuración de modelos por tier.
             curses.curs_set(0)
             model_config = _show_model_config(stdscr, model_config)
-            log.lines.append('[TUI] configuración de modelos actualizada. '
+            log.append_msg('[TUI] configuración de modelos actualizada. '
                              'Reinicia el harness para aplicar (tecla S).')
             stdscr.clear()
             last_refresh = 0

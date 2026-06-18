@@ -15,7 +15,7 @@ suscripciones** del usuario y no agotar una sola.
 | | | `kimi-k2.7-code` | **código** especializado |
 | | | `glm-5.2`, `qwen3.7-max` | tareas **pesadas** |
 | OpenCode (free, bonus) | `opencode/` | `deepseek-v4-flash-free`, `mimo-v2.5-free` | relleno gratis (rate-limited) |
-| **Google** (gemini CLI) | `gemini/` | `gemini-2.5-flash` | tareas **ligeras/medias**, rápido y barato |
+| **Google** (gemini CLI) | `gemini/` | `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-pro-preview` | tareas **ligeras/medias**; el "Gemini 3 Pro" es `gemini-3-pro-preview` (NO `gemini-3-pro`/`3.1-pro`, que solo existen vía `opencode/`) |
 | **OpenAI** (codex CLI) | `codex/` | `gpt-5.5` | tareas **difíciles** (razonador fuerte; caro/lento, ~10K tok por respuesta) |
 
 > `opencode/deepseek-v4-pro` NO existe. DeepSeek V4 (pro/flash) vive bajo `opencode-go/`.

@@ -61,10 +61,10 @@ class Node:
     name: str
     base_url: str
     online: bool
-    gpus: list
+    gpus: list[Gpu]
     cpu: Optional[CpuSlot] = None
-    models: list = field(default_factory=list)
-    running: dict = field(default_factory=dict)
+    models: list[str] = field(default_factory=list)
+    running: dict[str, int] = field(default_factory=dict)
     is_local: bool = False
 
 
@@ -99,6 +99,8 @@ def discover_local_gpus() -> list:
             uuid = parts[5]
         except ValueError:
             continue
+        if total <= 0:
+            continue
         out.append(Gpu(
             index=idx,
             name=name,
@@ -126,7 +128,7 @@ def discover_models(base_url: str) -> list:
         if 'embed' in name.lower():
             continue
         out.append(name)
-    return sorted(set(out))
+    return sorted(list(dict.fromkeys(out)))
 
 
 def discover_running(base_url: str) -> dict:
@@ -142,7 +144,7 @@ def discover_running(base_url: str) -> dict:
         name = (m.get('name') or '').strip()
         if not name:
             continue
-        size_vram = int(m.get('size_vram', 0) or 0)
+        size_vram = max(0, int(m.get('size_vram', 0) or 0))
         out[name] = size_vram // (1024 * 1024)
     return out
 
@@ -178,7 +180,7 @@ def discover_node(name: str, base_url: str) -> Node:
 
 def _make_ollama_spec(node: Node, model_name: str, gpu: Optional[Gpu], role: str) -> ModelSpec:
     if gpu is not None:
-        num_ctx = 8192 if gpu.vram_total_mib < 8000 else 32768
+        num_ctx = 8192 if gpu.vram_total_mib < SMALL_GPU_VRAM_THRESHOLD_MIB else 32768
     else:
         num_ctx = 32768
     spec = ModelSpec(
@@ -214,9 +216,8 @@ def plan_models(node: Node) -> dict:
     - rank=0 (GPU mas grande): candidato a fixer si 30B disponible.
     - rank>=1 (GPUs menores) O GPUs small: solo SMALL_HUNTER_PREF.
     """
-    if not node.gpus:
-        return {'hunter': [], 'fixer': None, 'reasoner': []}
-
+    # Sin GPUs NO retornamos temprano: un nodo CPU-only (p.ej. remoto) todavía
+    # puede servir un reasoner (el loop de GPUs simplemente no asigna nada).
     installed = set(node.models)
     gpus_sorted = sorted(node.gpus, key=lambda g: -g.vram_total_mib)
 
@@ -224,6 +225,7 @@ def plan_models(node: Node) -> dict:
     fixer_spec: Optional[ModelSpec] = None
     reasoner_specs: list = []
 
+    # HEADROOM (0.80) se aplicará en el futuro cuando se implemente VRAM budget checking
     for rank, gpu in enumerate(gpus_sorted):
         if _is_big_gpu(gpu) and rank == 0:
             # Big GPU, primera. Para EVITAR thrashing/OOM (el 30B ≈12.3GB ya casi
@@ -345,7 +347,8 @@ def _parse_loop_nodes(raw: str) -> list:
 
 
 def build_fleet() -> Fleet:
-    raw = os.environ.get('LOOP_NODES', 'localhost=http://host.docker.internal:11434')
+    default_base = os.environ.get('LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+    raw = os.environ.get('LOOP_NODES') or f'localhost={default_base}'
     nodes: list = []
     for name, base_url in _parse_loop_nodes(raw):
         try:
@@ -384,7 +387,7 @@ def write_fleet_status(fleet: Fleet, path: str = FLEET_STATUS_PATH) -> None:
     tmp_path = f'{path}.tmp'
     try:
         with open(tmp_path, 'w') as f:
-            json.dump(payload, f, indent=2, default=str)
+            json.dump(payload, f, indent=2)
         os.replace(tmp_path, path)
     except OSError as e:
         logging.warning(f'fleet: write_fleet_status failed for {path!r}: {e}')
@@ -393,7 +396,7 @@ def write_fleet_status(fleet: Fleet, path: str = FLEET_STATUS_PATH) -> None:
 def _health_loop_body(fleet: Fleet, shutdown_event: threading.Event) -> None:
     while not shutdown_event.is_set():
         try:
-            for node in fleet.nodes:
+            for node in list(fleet.nodes):
                 try:
                     node.models = discover_models(node.base_url)
                     node.running = discover_running(node.base_url)

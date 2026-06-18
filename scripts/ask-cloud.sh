@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
-# ask-cloud — delega un PROMPT (por STDIN) a un modelo CLOUD BARATO vía opencode,
-# para que Claude Code queme cuota barata (Minimax/OpenCode) en vez de Opus.
-# opencode usa su ~/.local/share/opencode/auth.json (MiniMax Token Plan + OpenCode Go);
-# NO necesita variables de entorno con llaves.
+# ask-cloud — delega un PROMPT (por STDIN) a un modelo CLOUD BARATO, repartiendo
+# carga entre TUS suscripciones/quotas para no agotar una sola. Para que Claude Code
+# queme cuota barata en vez de Opus. Rutea por prefijo del modelo:
 #
-# Uso:   echo "PROMPT COMPLETO" | scripts/ask-cloud.sh [modelo]
-#   modelo (opcional, default minimax/MiniMax-M3). Otros: opencode/glm-5,
-#   opencode/kimi-k2.6, opencode/gpt-5.5, opencode/gemini-3.5-flash, opencode/minimax-m2.5.
+#   opencode/*, opencode-go/*, minimax/*  ->  opencode run   (Minimax Token Plan / OpenCode Go)
+#   gemini/*                              ->  gemini -m       (quota Google)
+#   codex/*                               ->  codex exec      (quota OpenAI; caro, para lo dificil)
+#
+# Uso:   echo "PROMPT" | scripts/ask-cloud.sh [modelo]
+#   default: minimax/MiniMax-M3
+#   ej: gemini/gemini-2.5-flash · codex/gpt-5.5 · opencode-go/deepseek-v4-pro
 set -uo pipefail
 MODEL="${1:-minimax/MiniMax-M3}"
-opencode run --model "$MODEL" - 2>/dev/null \
-  | sed -E 's/\x1b\[[0-9;]*m//g; /^> build ·/d; /^build ·/d' \
-  | sed '/./,$!d'    # quita líneas en blanco iniciales
+PROMPT="$(cat)"
+STRIP_ANSI='s/\x1b\[[0-9;]*m//g'
+
+case "$MODEL" in
+  gemini/*)
+    gemini -m "${MODEL#gemini/}" -p "$PROMPT" --output-format text </dev/null 2>/dev/null \
+      | sed -E "$STRIP_ANSI" | grep -vE 'Ripgrep is not available|Falling back to' ;;
+  codex/*)
+    codex exec --model "${MODEL#codex/}" --skip-git-repo-check "$PROMPT" 2>/dev/null \
+      | sed -E "$STRIP_ANSI" \
+      | grep -vE '^(warning:|tokens used|[0-9,]+$|codex$|-{3,})' ;;
+  *)  # opencode / opencode-go / minimax  -> opencode CLI (lee stdin con '-')
+    printf '%s' "$PROMPT" | opencode run --model "$MODEL" - 2>/dev/null \
+      | sed -E "$STRIP_ANSI; /^> build ·/d; /^build ·/d" | sed '/./,$!d' ;;
+esac

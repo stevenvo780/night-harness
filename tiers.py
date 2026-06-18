@@ -78,7 +78,7 @@ class ModelSpec:
 # quemamos GPU/CPU a full.
 #
 # ESTRATEGIA (jul-2026, run real): 2 modelos locales en PARALELO sin contención:
-#   · LOCAL_GPU: 30B en RTX 5070 Ti (10.6GB VRAM, 1-3s por respuesta).
+#   · LOCAL_GPU: 30B en RTX 5070 Ti (~12.3GB VRAM, 1-3s por respuesta).
 #   · LOCAL_CPU: 80B CPU explícito (32 cores ociosos, 30-60s por respuesta).
 # Con 4 hunters 30B + 2 hunters 80B CPU = 6 hilos, sin contención entre
 # GPU y CPU. La CPU tiene load 22/32 (24% idle) y la GPU 14% util → hay

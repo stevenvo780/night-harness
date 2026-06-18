@@ -5,7 +5,7 @@
 # USO: ./watch.sh [STATUS_FILE] [LOG_FILE]
 #   defaults: /tmp/loop-v6-status.json, /tmp/loop-v6.log
 
-set -uo pipefail
+set -euo pipefail
 
 STATUS_FILE="${1:-/tmp/loop-v6-status.json}"
 LOG_FILE="${2:-/tmp/loop-v6.log}"

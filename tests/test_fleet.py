@@ -81,7 +81,7 @@ class TestPlanModels(unittest.TestCase):
     """plan_models asigna hunter/fixer/reasoner segun VRAM."""
 
     def test_no_gpus_returns_empty(self):
-        node = _make_node(gpus=[], models=['qwen3-coder:30b'])
+        node = _make_node(gpus=[], models=[])
         result = plan_models(node)
         self.assertEqual(result['hunter'], [])
         self.assertIsNone(result['fixer'])

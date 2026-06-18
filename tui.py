@@ -45,7 +45,6 @@ import subprocess
 import sys
 import time
 from collections import Counter, deque
-from datetime import datetime
 
 STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else '/tmp/loop-v6-status.json'
 LOG_FILE = sys.argv[2] if len(sys.argv) > 2 else '/tmp/loop-v6.log'
@@ -511,7 +510,7 @@ def _show_model_config(stdscr, config: dict) -> dict:
         stdscr.erase()
         # Header.
         header = 'CONFIGURACIÓN DE MODELOS POR TIER'
-        stdscr.addstr(0, max(1, (w - len(header)) // 2), header,
+        stdscr.addstr(0, max(1, (w - len(header)) // 2), header[:w - 2],
                       curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
         # Items.
         for i in range(scroll, min(len(items), scroll + visible)):

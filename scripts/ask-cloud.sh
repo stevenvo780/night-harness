@@ -10,7 +10,7 @@
 # Uso:   echo "PROMPT" | scripts/ask-cloud.sh [modelo]
 #   default: minimax/MiniMax-M3
 #   ej: gemini/gemini-2.5-flash · codex/gpt-5.5 · opencode-go/deepseek-v4-pro
-set -uo pipefail
+set -euo pipefail
 MODEL="${1:-minimax/MiniMax-M3}"
 PROMPT="$(cat)"
 STRIP_ANSI='s/\x1b\[[0-9;]*m//g'

@@ -1296,8 +1296,6 @@ def filter_worker(filters: list[tiers.ModelSpec], wid: int) -> None:
                 log(f'  [filter-{wid}] DISCORD [{real_count}R/{notbug_count}N/{unclear_count}U] '
                     f'{s.file}:{s.line} → escalado a juez ({specs_used_str})')
                 bugq.put_nowait(b)
-                with STATS_LOCK:
-                    STATS['suspects_filtered_as_known_fp'] += 0  # no es FP
             except queue.Full:
                 pass
 
@@ -1553,16 +1551,6 @@ def _looks_like_patch(text: str) -> bool:
             or ('--- ' in text and '+++ ' in text and '@@' in text))
 
 
-def _patch_files(diff_text: str) -> set:
-    files = set()
-    for ln in diff_text.splitlines():
-        if ln.startswith(('+++ ', '--- ')):
-            p = ln[4:].strip()
-            if p and p != '/dev/null':
-                files.add(re.sub(r'^[ab]/', '', p))
-    return files
-
-
 def _apply_patch(diff_text: str) -> bool:
     try:
         r = subprocess.run(['git', 'apply', '--3way', '--whitespace=nowarn', '-'],
@@ -1807,11 +1795,6 @@ def _map_e2e_route_to_file(route: str) -> Optional[str]:
             return cand
     log(f'    [e2e-map] {route} → no encontrado en {candidates}')
     return None
-
-def e2e_sweep_worker(zone: str) -> None:
-    """DEPRECATED wrapper. Usar e2e_task_worker en su lugar (consume e2e_taskq)."""
-    return _e2e_task_worker()
-
 
 def _e2e_task_worker(wid: int = 0) -> None:
     """Worker E2E: consume tareas de `e2e_taskq` y emite hallazgos a suspectq.

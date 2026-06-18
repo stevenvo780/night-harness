@@ -22,8 +22,26 @@ LOCAL_TOKENS = ('localhost', '127.0.0.1', 'host.docker.internal')
 SMALL_GPU_VRAM_THRESHOLD_MIB = 8000
 
 BIG_HUNTER_PREF = ('qwen3-coder:30b', 'devstral:24b', 'qwen3:14b')
-SMALL_HUNTER_PREF = ('qwen2.5-coder:7b', 'qwen2.5:3b')
-CPU_REASONER_PREF = ('qwen3-coder-next:cpu',)
+# Small GPU: 3b primero para que la 2060 NO compita con la 5070 por el 7b.
+SMALL_HUNTER_PREF = ('qwen2.5-coder:3b', 'qwen2.5:3b', 'gemma3:4b', 'qwen2.5-coder:7b')
+# Fallback big-GPU: si la 5070 Ti no tiene 30b/24b/14b, baja a 7b.
+# Evita que GPUs potentes queden ociosas en máquinas sin el 30b instalado.
+BIG_GPU_FALLBACK_PREF = ('qwen2.5-coder:7b', 'qwen2.5-coder:3b', 'gemma3:4b')
+# Hunters que puede correr un nodo CPU-only (laptop, server sin GPU).
+# El primero que esté instalado en el nodo gana. Diseñado para exprimir
+# al máximo la RAM disponible sin caer a swap.
+# Orden: de MAYOR a menor consumo de RAM — el fleet toma el primero disponible
+# y NO comprueba si cabe en la RAM del nodo (lo hace ollama al cargar).
+# El usuario debe asegurar que el modelo elegido cabe en su RAM.
+#   llama3.1:70b-q4 ≈ 40GB  →  requiere nodo con ≥44GB RAM
+#   qwen3:32b ≈ 20GB        →  ≥24GB
+#   gpt-oss:20b ≈ 12GB      →  ≥16GB
+#   nemotron-3-nano:30b ≈ 22GB → ≥26GB (RECOMENDADO para laptops 32-42GB)
+#   devstral:24b ≈ 14GB     →  ≥18GB
+#   qwen2.5-coder:7b ≈ 5GB  →  ≥8GB (fallback universal)
+CPU_HUNTER_PREF = ('nemotron-3-nano:30b', 'qwen3:32b', 'gpt-oss:20b',
+                   'devstral:24b', 'qwen2.5-coder:7b', 'llama3.1:70b-instruct-q4_K_M')
+CPU_REASONER_PREF = ('qwen3-coder-next:cpu', 'qwen3-coder:30b')
 
 # VRAM estimation: spec §4.4 — est_vram_mib(size_bytes) = size_bytes / MiB * 1.10
 VRAM_OVERHEAD = 1.10
@@ -231,7 +249,8 @@ def plan_models(node: Node) -> dict:
             # Big GPU, primera. Para EVITAR thrashing/OOM (el 30B ≈12.3GB ya casi
             # llena los 16GB), NO apilamos varios modelos grandes en la misma GPU:
             # el 30B sirve como fixer Y como hunter. Si no hay 30B, un único big
-            # hunter que quepa.
+            # hunter que quepa. Si tampoco hay 14b/24b, FALLBACK a 7b/3b para
+            # que la GPU no quede ociosa.
             fixer_model = 'qwen3-coder:30b' if 'qwen3-coder:30b' in installed else None
             if fixer_model is not None:
                 fixer_spec = _make_ollama_spec(node, fixer_model, gpu, 'fixer')
@@ -239,12 +258,22 @@ def plan_models(node: Node) -> dict:
                 gpu.assigned_role = 'hunter_fixer'
                 hunter_specs.append(_make_ollama_spec(node, fixer_model, gpu, 'hunter'))
             else:
+                assigned = False
                 for pref in BIG_HUNTER_PREF:
                     if pref in installed:
                         hunter_specs.append(_make_ollama_spec(node, pref, gpu, 'hunter'))
                         gpu.assigned_model = pref
                         gpu.assigned_role = 'hunter'
+                        assigned = True
                         break
+                # Fallback big GPU → small hunter (evita GPU potente ociosa)
+                if not assigned:
+                    for pref in BIG_GPU_FALLBACK_PREF:
+                        if pref in installed:
+                            hunter_specs.append(_make_ollama_spec(node, pref, gpu, 'hunter'))
+                            gpu.assigned_model = pref
+                            gpu.assigned_role = 'hunter'
+                            break
         else:
             # Small GPU o GPUs adicionales (rank >= 1) → solo small hunters
             # Esto garantiza que un 14b no se asigne a la RTX 2060 (6144 MiB).
@@ -256,13 +285,46 @@ def plan_models(node: Node) -> dict:
                         gpu.assigned_role = 'hunter'
                     break
 
+    # CPU slot: para nodos locales, `node.cpu` es CpuSlot(); para nodos
+    # remotos (laptop, server) sin info de CPU local, lo tratamos como
+    # CPU-only con CpuSlot() vacío para poder asignar hunters.
+    cpu_slot = node.cpu if node.cpu is not None else CpuSlot()
+
+    # 1) Reasoner: si hay modelo grande CPU, lo asignamos como reasoner.
+    reasoner_assigned = False
+    for pref in CPU_REASONER_PREF:
+        if pref in installed:
+            spec = _make_ollama_spec(node, pref, None, 'reasoner')
+            reasoner_specs.append(spec)
+            cpu_slot.assigned_model = pref
+            cpu_slot.assigned_role = 'reasoner'
+            reasoner_assigned = True
+            break
+    # Si es nodo local, persistir el cpu_slot.
     if node.cpu is not None:
-        for pref in CPU_REASONER_PREF:
+        node.cpu = cpu_slot
+
+    # 2) CPU hunter: si el nodo NO tiene GPUs (laptop/server remoto CPU-only),
+    # o si tiene GPUs pero NO reasoner y el modelo CPU es distinto al GPU,
+    # podemos paralelizar CPU+GPU en el mismo nodo.
+    if not gpus_sorted and not reasoner_assigned:
+        # Nodo CPU-only (laptop): primer modelo en CPU_HUNTER_PREF que esté.
+        for pref in CPU_HUNTER_PREF:
             if pref in installed:
-                spec = _make_ollama_spec(node, pref, None, 'reasoner')
-                reasoner_specs.append(spec)
-                node.cpu.assigned_model = pref
-                node.cpu.assigned_role = 'reasoner'
+                spec = _make_ollama_spec(node, pref, None, 'hunter')
+                hunter_specs.append(spec)
+                cpu_slot.assigned_model = pref
+                cpu_slot.assigned_role = 'hunter'
+                break
+    elif gpus_sorted and not reasoner_assigned:
+        # Nodo con GPUs: añade hunter CPU si es DISTINTO al GPU ya asignado.
+        for pref in CPU_HUNTER_PREF:
+            if pref in installed and pref not in (g.assigned_model for g in gpus_sorted):
+                spec = _make_ollama_spec(node, pref, None, 'hunter')
+                hunter_specs.append(spec)
+                if cpu_slot.assigned_model is None:
+                    cpu_slot.assigned_model = pref
+                    cpu_slot.assigned_role = 'hunter'
                 break
 
     return {'hunter': hunter_specs, 'fixer': fixer_spec, 'reasoner': reasoner_specs}

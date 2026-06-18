@@ -41,7 +41,7 @@ BIG_GPU_FALLBACK_PREF = ('qwen2.5-coder:7b', 'qwen2.5-coder:3b', 'gemma3:4b')
 #   qwen2.5-coder:7b ≈ 5GB  →  ≥8GB (fallback universal)
 CPU_HUNTER_PREF = ('nemotron-3-nano:30b', 'qwen3:32b', 'gpt-oss:20b',
                    'devstral:24b', 'qwen2.5-coder:7b', 'llama3.1:70b-instruct-q4_K_M')
-CPU_REASONER_PREF = ('qwen3-coder-next:cpu', 'qwen3-coder:30b')
+CPU_REASONER_PREF = ('qwen3-coder-next:q4_K_M', 'qwen3-coder-next:cpu', 'qwen3-coder:30b')
 
 # VRAM estimation: spec §4.4 — est_vram_mib(size_bytes) = size_bytes / MiB * 1.10
 VRAM_OVERHEAD = 1.10
@@ -303,6 +303,40 @@ def plan_models(node: Node) -> dict:
     # Si es nodo local, persistir el cpu_slot.
     if node.cpu is not None:
         node.cpu = cpu_slot
+
+    # Budget fill: exprimir VRAM libre metiendo modelos EXTRA en la misma GPU.
+    # El primer modelo ya se asignó arriba; ahora, si sobra VRAM, llenamos
+    # con cuantos modelos chicos adicionales quepan (sin duplicarlos entre GPUs).
+    # Cada modelo extra = otro hunter en paralelo = más abundancia.
+    _FILL_VRAM_EST: dict[str, int] = {
+        '3b': 2200, '4b': 3700, '7b': 5500, '9b': 7000,
+        '12b': 8000, '14b': 9000, '20b': 13000, '24b': 15000,
+        '30b': 13000, '32b': 20000,
+    }
+    assigned_models = {g.assigned_model for g in gpus_sorted if g.assigned_model}
+    assigned_models.update(
+        spec.id.rsplit(':', 1)[-1] for spec in hunter_specs if spec.id.startswith('ollama:')
+    )
+    # VRAM budget: 80% del total de la GPU, menos lo ya asignado.
+    gpu_budget: dict[int, int] = {}
+    for gpu in gpus_sorted:
+        est_assigned = next(
+            (v for k, v in _FILL_VRAM_EST.items() if gpu.assigned_model and k in gpu.assigned_model),
+            4000,
+        )
+        gpu_budget[gpu.index] = int(gpu.vram_total_mib * 0.85) - est_assigned
+    for gpu in gpus_sorted:
+        for pref in SMALL_HUNTER_PREF + BIG_GPU_FALLBACK_PREF:
+            base = pref.rsplit(':', 1)[-1] if ':' in pref else pref
+            if pref in installed and pref not in assigned_models:
+                est = next(
+                    (v for k, v in _FILL_VRAM_EST.items() if k in base),
+                    4000,
+                )
+                if gpu_budget.get(gpu.index, 0) > est:
+                    hunter_specs.append(_make_ollama_spec(node, pref, gpu, 'hunter'))
+                    gpu_budget[gpu.index] -= est
+                    assigned_models.add(pref)
 
     # 2) CPU hunter: si el nodo NO tiene GPUs (laptop/server remoto CPU-only),
     # o si tiene GPUs pero NO reasoner y el modelo CPU es distinto al GPU,

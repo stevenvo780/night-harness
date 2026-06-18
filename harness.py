@@ -1006,7 +1006,9 @@ def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
                         role='hunter', location=node_name, node=node_name,
                         model=hunter_spec.id,
                         status='busy', current_file='', calls=0)
-    for file in zone_files:
+    for file in itertools.cycle(zone_files):
+        if shutdown.is_set():
+            break
         path = WT / SUBDIR / file
         if not path.exists():
             continue

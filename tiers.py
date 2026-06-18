@@ -59,6 +59,16 @@ class ModelSpec:
     """Tags: 'code', 'vision', 'fast', 'reasoning', 'json', 'long', 'fix'."""
     command_template: Optional[str] = None
     """Si es None, se infiere del id. Para 'ollama:foo' se usa `curl` al endpoint."""
+    base_url: Optional[str] = None
+    """Base URL para modelos Ollama. None => LOOP_OLLAMA_BASE."""
+    gpu_index: Optional[int] = None
+    """GPU a pinear para este modelo."""
+    gpu_uuid: Optional[str] = None
+    """UUID de la GPU (para identificación dinámica)."""
+    node: Optional[str] = None
+    """Nombre del nodo donde corre este modelo."""
+    num_ctx: Optional[int] = None
+    """Contexto a pedir a Ollama (ajustado por VRAM)."""
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +86,7 @@ class ModelSpec:
 # ---------------------------------------------------------------------------
 
 TIER0_HUNTERS: tuple[ModelSpec, ...] = (
-    # LOCAL_GPU: 30B, ~10.6GB VRAM. Hunter principal (1-3s por respuesta).
+    # LOCAL_GPU: 30B, ~12.3GB VRAM residente. Hunter principal (1-3s por respuesta).
     # Hunters con índice 0, 2, 4, 6 (pares) usan este.
     ModelSpec(
         id='ollama:qwen3-coder:30b',

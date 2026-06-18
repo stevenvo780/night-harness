@@ -56,6 +56,9 @@ OLLAMA_URL = 'http://host.docker.internal:11434'
 REFRESH_SEC = 2.0
 LOG_LINES = 200  # cuántas líneas del log mantener en memoria
 
+# Schema version esperado del status JSON (producido por harness.write_status).
+SCHEMA_VERSION = 2
+
 # Colores.
 COLOR_PAIR_DEFAULT = 1
 COLOR_PAIR_HEADER = 2
@@ -256,9 +259,62 @@ def model_family_short(model_id: str) -> str:
 def read_status(path: str) -> dict:
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, json.JSONDecodeError, FileNotFoundError):
         return {}
+    sv = data.get('schema_version', 1)
+    if sv != SCHEMA_VERSION:
+        data['_schema_warning'] = f'schema {sv} != expected {SCHEMA_VERSION}'
+    return data
+
+
+def _safe_int(val, default: int = 0) -> int:
+    """Convierte val a int de forma segura. Nunca falla con TypeError."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_get_funnel(status: dict) -> dict:
+    """Devuelve funnel con defaults seguros. Soporta schema v1 (stats) y v2 (funnel)."""
+    f = status.get('funnel')
+    if isinstance(f, dict):
+        return f
+    # Fallback schema v1: leer de 'stats'
+    s = status.get('stats', {}) or {}
+    return {
+        'suspects_produced': _safe_int(s.get('suspects_produced', 0)),
+        'suspects_refuted': _safe_int(s.get('suspects_refuted_by_filter', 0)),
+        'suspects_known_fp': _safe_int(s.get('suspects_filtered_as_known_fp', 0)),
+        'bugs_confirmed': _safe_int(s.get('bugs_confirmed', 0)),
+        'fixes_attempted': _safe_int(s.get('fixes_attempted', 0)),
+        'fixes_succeeded': _safe_int(s.get('fixes_succeeded', 0)),
+        'fixes_reverted': _safe_int(s.get('fixes_reverted', 0)),
+        'fixes_to_review': _safe_int(s.get('fixes_to_review', 0)),
+        'e2e_findings': _safe_int(s.get('e2e_findings', 0)),
+        'opus_invocations': _safe_int(s.get('opus_invocations', 0)),
+        'rounds': _safe_int(s.get('rounds', 0)),
+        'clean_rounds_in_a_row': _safe_int(s.get('clean_rounds_in_a_row', 0)),
+    }
+
+
+def _safe_get_roles(status: dict) -> list:
+    """Devuelve roles[] o lista vacía."""
+    r = status.get('roles')
+    return r if isinstance(r, list) else []
+
+
+def _safe_get_nodes(status: dict) -> list:
+    """Devuelve nodes[] o lista vacía."""
+    n = status.get('nodes')
+    return n if isinstance(n, list) else []
+
+
+def _safe_get_threads(status: dict) -> list:
+    """Devuelve threads[] o lista vacía."""
+    t = status.get('threads')
+    return t if isinstance(t, list) else []
 
 
 def read_log_calls(path: str, window_sec: int = 30) -> Counter:
@@ -500,55 +556,63 @@ def _show_model_config(stdscr, config: dict) -> dict:
 
 
 def draw_header(stdscr, status: dict, harness_alive: bool, y: int = 0) -> int:
-    """Header con el estado del harness. Retorna la siguiente línea libre."""
+    """Header con el estado del harness. Retorna la siguiente línea libre.
+    Soporta schema v1 (stats) y v2 (funnel). Badge schema vN en header."""
     h, w = stdscr.getmaxyx()
+    sv = _safe_int(status.get('schema_version', 1), 1)
     if harness_alive:
-        title = f"HARNESS v6 — ACTIVO (PID {status.get('pid', '?')})"
+        title = f"HARNESS v6 — ACTIVO (PID {status.get('pid', '?')}) [schema v{sv}]"
         title_color = curses.color_pair(COLOR_PAIR_GREEN) | curses.A_BOLD
     else:
-        title = f"HARNESS v6 — MUERTO (PID {status.get('pid', '?')})"
+        title = f"HARNESS v6 — MUERTO (PID {status.get('pid', '?')}) [schema v{sv}]"
         title_color = curses.color_pair(COLOR_PAIR_RED) | curses.A_BOLD
 
     stdscr.addstr(y, 1, '═' * (w - 2), curses.color_pair(COLOR_PAIR_HEADER))
     stdscr.addstr(y, max(1, (w - len(title)) // 2), title, title_color)
     y += 1
-    s = status.get('stats', {})
-    up = status.get('uptime_sec', 0)
+    # Leer de funnel (v2) con fallback a stats (v1)
+    f = _safe_get_funnel(status)
+    up = _safe_int(status.get('uptime_sec', 0))
     h_, m_, s_ = up // 3600, (up % 3600) // 60, up % 60
     uptime_str = f"{h_:02d}:{m_:02d}:{s_:02d}"
     line1 = (
-        f"  Uptime: {uptime_str}  │  Rounds: {s.get('rounds', 0)}  "
-        f"│  Clean: {s.get('clean_rounds_in_a_row', 0)}  "
-        f"│  Suspects: {s.get('suspects_produced', 0)}  "
-        f"│  Refutados: {s.get('suspects_refuted_by_filter', 0)}"
+        f"  Uptime: {uptime_str}  |  Round: {f.get('rounds', 0)}  "
+        f"|  Clean: {f.get('clean_rounds_in_a_row', 0)}  "
+        f"|  Suspects: {f.get('suspects_produced', 0)}  "
+        f"|  Refutados: {f.get('suspects_refuted', f.get('suspects_refuted_by_filter', 0))}"
     )
-    stdscr.addstr(y, 1, line1[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+    try:
+        stdscr.addstr(y, 1, line1[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+    except curses.error:
+        pass
     y += 1
-    bugs = s.get('bugs_confirmed', 0)
+    bugs = _safe_int(f.get('bugs_confirmed', 0))
     bug_color = COLOR_PAIR_RED if bugs > 0 else COLOR_PAIR_DEFAULT
-    fixes = s.get('fixes_succeeded', 0)
+    fixes = _safe_int(f.get('fixes_succeeded', 0))
     fix_color = COLOR_PAIR_GREEN if fixes > 0 else COLOR_PAIR_DEFAULT
-    opus = s.get('opus_invocations', 0)
+    opus = _safe_int(f.get('opus_invocations', 0))
     opus_color = COLOR_PAIR_MAGENTA if opus > 0 else COLOR_PAIR_DEFAULT
-    line2 = (
-        f"  Bugs: "
-    )
-    stdscr.addstr(y, 1, line2, curses.color_pair(COLOR_PAIR_DEFAULT))
-    stdscr.addstr(y, 1 + len(line2), f"{bugs} confirmados",
-                 curses.color_pair(bug_color) | curses.A_BOLD)
-    pos = 1 + len(line2) + len(f"{bugs} confirmados")
-    stdscr.addstr(y, pos, "  │  Fixes: ", curses.color_pair(COLOR_PAIR_DEFAULT))
-    pos += len("  │  Fixes: ")
-    stdscr.addstr(y, pos, f"{fixes} OK / {s.get('fixes_attempted', 0)} att / "
-                          f"{s.get('fixes_reverted', 0)} rev",
-                 curses.color_pair(fix_color) | curses.A_BOLD)
-    pos += len(f"{fixes} OK / {s.get('fixes_attempted', 0)} att / "
-               f"{s.get('fixes_reverted', 0)} rev")
-    stdscr.addstr(y, pos, "  │  Opus: ", curses.color_pair(COLOR_PAIR_DEFAULT))
-    pos += len("  │  Opus: ")
-    stdscr.addstr(y, pos, f"{opus} invocaciones", curses.color_pair(opus_color) | curses.A_BOLD)
+    try:
+        line2 = "  Bugs: "
+        stdscr.addstr(y, 1, line2, curses.color_pair(COLOR_PAIR_DEFAULT))
+        stdscr.addstr(y, 1 + len(line2), f"{bugs} confirm",
+                     curses.color_pair(bug_color) | curses.A_BOLD)
+        pos = 1 + len(line2) + len(f"{bugs} confirm")
+        stdscr.addstr(y, pos, "  |  FixOK: ", curses.color_pair(COLOR_PAIR_DEFAULT))
+        pos += len("  |  FixOK: ")
+        fixes_str = f"{fixes}/{f.get('fixes_attempted', 0)} att"
+        stdscr.addstr(y, pos, fixes_str, curses.color_pair(fix_color) | curses.A_BOLD)
+        pos += len(fixes_str)
+        stdscr.addstr(y, pos, "  |  Opus: ", curses.color_pair(COLOR_PAIR_DEFAULT))
+        pos += len("  |  Opus: ")
+        stdscr.addstr(y, pos, str(opus), curses.color_pair(opus_color) | curses.A_BOLD)
+    except curses.error:
+        pass
     y += 1
-    stdscr.addstr(y, 1, '─' * (w - 2), gray_attr())
+    try:
+        stdscr.addstr(y, 1, '─' * (w - 2), gray_attr())
+    except curses.error:
+        pass
     return y + 1
 
 
@@ -798,12 +862,209 @@ def draw_process_containers(stdscr, status: dict, y: int) -> int:
             y += 1
 
     # Orquestador.
-    orch_prompts = len(status.get('orchestrator', {}).get('hunting_prompts', []))
-    orch_journeys = len(status.get('orchestrator', {}).get('e2e_journeys', []))
-    if orch_prompts or orch_journeys:
-        orch_line = f' 🧠 Orquest.   ✓ {orch_prompts} prompts, {orch_journeys} journeys'
+    orch = status.get('orchestrator', {}) or {}
+    # FIX crash: schema v2 usa hunting_prompts_n (int directo). Fallback a
+    # hunting_prompts si el campo es int (schema v1 en transicion).
+    # NUNCA hacemos len() sobre un campo que puede ser int.
+    orch_prompts_n = orch.get('hunting_prompts_n')
+    if orch_prompts_n is None:
+        # Compatibilidad v1: el campo puede ser int o lista
+        raw = orch.get('hunting_prompts', 0)
+        orch_prompts_n = len(raw) if isinstance(raw, (list, tuple)) else _safe_int(raw, 0)
+    else:
+        orch_prompts_n = _safe_int(orch_prompts_n, 0)
+    orch_journeys_n = orch.get('e2e_journeys_n')
+    if orch_journeys_n is None:
+        raw = orch.get('e2e_journeys', 0)
+        orch_journeys_n = len(raw) if isinstance(raw, (list, tuple)) else _safe_int(raw, 0)
+    else:
+        orch_journeys_n = _safe_int(orch_journeys_n, 0)
+    if orch_prompts_n or orch_journeys_n:
+        orch_line = f' Orquest.  {orch_prompts_n} prompts, {orch_journeys_n} journeys'
         try:
             stdscr.addstr(y, 1, orch_line[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+        except curses.error:
+            pass
+        y += 1
+    return y
+
+
+def draw_nodes_panel(stdscr, status: dict, y: int) -> int:
+    """Panel NODOS: por nodo muestra GPUs con util%/VRAM/modelo cargado.
+    Schema v2: lee status['nodes'] (lista). Si el harness no ha escrito nodes aun,
+    muestra placeholder. Seguro: nunca llama len() sobre int."""
+    h, w = stdscr.getmaxyx()
+    nodes = _safe_get_nodes(status)
+    if not nodes:
+        try:
+            stdscr.addstr(y, 1, '[ NODOS: sin datos (harness no activo o schema v1) ]',
+                          gray_attr())
+        except curses.error:
+            pass
+        return y + 1
+    try:
+        stdscr.addstr(y, 1, '─── NODOS ─────────────────────────────────────────', gray_attr())
+    except curses.error:
+        pass
+    y += 1
+    for node in nodes:
+        if y >= h - 2:
+            break
+        alive = node.get('alive', False)
+        bullet = '*' if alive else 'o'
+        bullet_color = curses.color_pair(COLOR_PAIR_GREEN) if alive else curses.color_pair(COLOR_PAIR_RED)
+        host = node.get('host', node.get('id', '?'))[:30]
+        latency = node.get('latency_ms', 0)
+        node_line = f' {host}  {latency}ms'
+        try:
+            stdscr.addstr(y, 1, bullet, bullet_color | curses.A_BOLD)
+            stdscr.addstr(y, 3, node_line[:w - 5], curses.color_pair(COLOR_PAIR_DEFAULT))
+        except curses.error:
+            pass
+        y += 1
+        # GPUs del nodo
+        gpus = node.get('gpus', []) or []
+        for g in gpus:
+            if y >= h - 2:
+                break
+            gi = _safe_int(g.get('index', 0))
+            gname = str(g.get('name', '?'))[:18]
+            util = _safe_int(g.get('util_pct', 0))
+            used_mib = _safe_int(g.get('vram_used_mib', 0))
+            total_mib = _safe_int(g.get('vram_total_mib', 1)) or 1
+            used_gb = used_mib / 1024
+            total_gb = total_mib / 1024
+            bar_width = 12
+            filled = int(bar_width * used_mib / total_mib)
+            bar = '#' * filled + '.' * (bar_width - filled)
+            loaded = g.get('loaded_models', []) or []
+            model_str = loaded[0][:16] if loaded else ('(libre)' if used_mib < 500 else '')
+            gpu_line = (f'   GPU{gi} {gname:<18s} {util:>3}%  '
+                        f'{used_gb:.1f}/{total_gb:.1f}GB [{bar}] {model_str}')
+            try:
+                stdscr.addstr(y, 1, gpu_line[:w - 2], curses.color_pair(COLOR_PAIR_DEFAULT))
+            except curses.error:
+                pass
+            y += 1
+        # Modelos Ollama cargados
+        ollama_models = node.get('ollama_models', []) or []
+        if ollama_models:
+            om_str = '   Ollama: ' + ', '.join(
+                f'{m["name"]}({m.get("vram_gb", 0):.1f}GB)' for m in ollama_models[:4]
+            )
+            try:
+                stdscr.addstr(y, 1, om_str[:w - 2], gray_attr())
+            except curses.error:
+                pass
+            y += 1
+    return y
+
+
+def draw_pipeline_panel(stdscr, status: dict, y: int) -> int:
+    """Panel PIPELINE: itera status['roles'] (schema v2), una fila por rol.
+    Contadores etiquetados (live N/M, busy B, calls C, /min M). Mata el '20/6'."""
+    h, w = stdscr.getmaxyx()
+    roles = _safe_get_roles(status)
+    if not roles:
+        # Fallback: delegate to legacy draw_process_containers logic omitted here
+        # (the old function still exists for the dashboard tab).
+        try:
+            stdscr.addstr(y, 1, '[ PIPELINE: sin datos roles[] (schema v1?) ]', gray_attr())
+        except curses.error:
+            pass
+        return y + 1
+    try:
+        stdscr.addstr(y, 1, '─── PIPELINE ──────────────────────────────────────', gray_attr())
+    except curses.error:
+        pass
+    y += 1
+    ROLE_ICON = {'hunter': 'H', 'filter': 'F', 'judge': 'J', 'fixer': 'X', 'cloud': 'C'}
+    for role_entry in roles:
+        if y >= h - 2:
+            break
+        role = role_entry.get('role', '?')
+        label = role_entry.get('label', role)[:14]
+        icon = ROLE_ICON.get(role, '?')
+        live_n = _safe_int(role_entry.get('live_n', 0))
+        conf_n = _safe_int(role_entry.get('configured_n', 0))
+        busy_n = _safe_int(role_entry.get('busy_n', 0))
+        quar_n = _safe_int(role_entry.get('quarantined_n', 0))
+        calls = _safe_int(role_entry.get('calls_total', 0))
+        cpm = role_entry.get('calls_per_min', 0.0)
+        to_n = _safe_int(role_entry.get('timeouts', 0))
+        role_line = (f' [{icon}] {label:<14s}  live {live_n}/{conf_n}'
+                     f'  busy:{busy_n}  q:{quar_n}  {calls}c  {cpm:.1f}/min  to:{to_n}')
+        try:
+            attr = curses.color_pair(COLOR_PAIR_DEFAULT)
+            if busy_n > 0:
+                attr |= curses.A_BOLD
+            stdscr.addstr(y, 1, role_line[:w - 2], attr)
+        except curses.error:
+            pass
+        y += 1
+        # Sub-línea: modelos usados
+        models = role_entry.get('models', []) or []
+        if models:
+            mods_str = '      ' + ', '.join(str(m).split(':')[-1][:14] for m in models[:5])
+            if len(models) > 5:
+                mods_str += f' +{len(models) - 5}'
+            try:
+                stdscr.addstr(y, 1, mods_str[:w - 2], gray_attr())
+            except curses.error:
+                pass
+            y += 1
+    return y
+
+
+def draw_funnel_panel(stdscr, status: dict, y: int) -> int:
+    """Panel EMBUDO: suspects→refutados→FP→confirmados→fixes con mini-barras.
+    Lee status['funnel'] (schema v2). Seguro: todos los campos via _safe_int."""
+    h, w = stdscr.getmaxyx()
+    f = _safe_get_funnel(status)
+    try:
+        stdscr.addstr(y, 1, '─── EMBUDO ─────────────────────────────────────────', gray_attr())
+    except curses.error:
+        pass
+    y += 1
+    suspects = _safe_int(f.get('suspects_produced', 0))
+    refuted = _safe_int(f.get('suspects_refuted', f.get('suspects_refuted_by_filter', 0)))
+    fp = _safe_int(f.get('suspects_known_fp', f.get('suspects_filtered_as_known_fp', 0)))
+    confirmed = _safe_int(f.get('bugs_confirmed', 0))
+    fixes_att = _safe_int(f.get('fixes_attempted', 0))
+    fixes_ok = _safe_int(f.get('fixes_succeeded', 0))
+    fixes_rev = _safe_int(f.get('fixes_reverted', 0))
+    to_review = _safe_int(f.get('fixes_to_review', 0))
+    e2e = _safe_int(f.get('e2e_findings', 0))
+    opus = _safe_int(f.get('opus_invocations', 0))
+
+    bar_max = max(suspects, 1)
+    BAR_W = 20
+
+    def _bar(val: int) -> str:
+        filled = int(BAR_W * val / bar_max)
+        return '[' + '#' * filled + '.' * (BAR_W - filled) + ']'
+
+    rows = [
+        ('Suspects', suspects, COLOR_PAIR_DEFAULT),
+        ('Refutados', refuted, COLOR_PAIR_YELLOW),
+        ('FP conocidos', fp, COLOR_PAIR_GRAY),
+        ('Confirmados', confirmed, COLOR_PAIR_RED),
+        ('Fixes att/OK', f'{fixes_att}/{fixes_ok}', COLOR_PAIR_GREEN),
+        ('Revertidos', fixes_rev, COLOR_PAIR_YELLOW),
+        ('A revisar', to_review, COLOR_PAIR_MAGENTA),
+        ('E2E findings', e2e, COLOR_PAIR_CYAN),
+        ('Opus', opus, COLOR_PAIR_MAGENTA),
+    ]
+    for label, val, color in rows:
+        if y >= h - 2:
+            break
+        if isinstance(val, int):
+            bar = _bar(val)
+            row_line = f'  {label:<14s} {val:>5}  {bar}'
+        else:
+            row_line = f'  {label:<14s} {str(val):>11}'
+        try:
+            stdscr.addstr(y, 1, row_line[:w - 2], curses.color_pair(color))
         except curses.error:
             pass
         y += 1
@@ -1066,7 +1327,18 @@ def main(stdscr):
         y = draw_tabs_header(stdscr, current_tab, y=y)
         # Render según tab activa.
         if current_tab == 'dashboard':
-            y = draw_process_containers(stdscr, last_status, y)
+            # Schema v2: paneles nuevos Pipeline → Funnel → Nodes
+            roles_available = bool(_safe_get_roles(last_status))
+            if roles_available:
+                if y < h - 4:
+                    y = draw_pipeline_panel(stdscr, last_status, y)
+                if y < h - 4:
+                    y = draw_funnel_panel(stdscr, last_status, y)
+                if y < h - 4:
+                    y = draw_nodes_panel(stdscr, last_status, y)
+            else:
+                # Fallback schema v1: legacy process containers
+                y = draw_process_containers(stdscr, last_status, y)
             if y < h - 12:
                 y = draw_system_panel(stdscr, last_cpu, last_gpus, last_ollama, y)
         elif current_tab == 'models':

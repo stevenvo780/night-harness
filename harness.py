@@ -56,10 +56,14 @@ from pathlib import Path
 from typing import Optional
 
 # Módulos del v6.
+import fleet
 import memory
 import orchestrator
 import quota
 import tiers
+
+# Fleet de hardware (GPUs/nodos + planificación por VRAM). Poblado en main().
+FLEET = None
 
 # ---------------------------------------------------------------------------
 # Config (env vars; con defaults razonables).
@@ -191,7 +195,8 @@ def update_thread_state(name: str, **kwargs) -> None:
     with THREAD_STATES_LOCK:
         if name not in THREAD_STATES:
             THREAD_STATES[name] = {
-                'kind': '?', 'model': '?', 'status': 'idle',
+                'kind': '?', 'role': None, 'location': 'local', 'node': 'local',
+                'model': '?', 'status': 'idle',
                 'current_file': '', 'current_task': '',
                 'started_at': time.time(), 'last_update': time.time(),
                 'calls': 0, 'errors': 0, 'avg_ms': 0,
@@ -213,24 +218,231 @@ def get_thread_states() -> list[dict]:
         return out
 
 
+def _build_roles() -> list:
+    """Construye la lista roles[] para el schema v2 a partir de THREAD_STATES."""
+    ROLE_ORDER = ['hunter', 'filter', 'judge', 'fixer', 'cloud']
+    CONFIGURED = {
+        'hunter': HUNTER_HILOS + SECOND_HILOS,
+        'filter': FILTER_HILOS,
+        'judge': JUDGE_HILOS,
+        'fixer': FIXER_HILOS,
+        'cloud': CLOUD_HUNTER_HILOS,
+    }
+    LABELS = {
+        'hunter': 'Hunters local', 'filter': 'Filtros', 'judge': 'Jueces',
+        'fixer': 'Fixers', 'cloud': 'Cloud hunters',
+    }
+    uptime = max(1, time.time() - STATS['started_at'])
+    # Aggregate per-role stats from THREAD_STATES
+    role_data: dict[str, dict] = {}
+    q_set = set(quarantined_models())
+    with THREAD_STATES_LOCK:
+        states_snapshot = list(THREAD_STATES.items())
+    for name, s in states_snapshot:
+        # Determine role: prefer new 'role' key, fallback to 'kind'
+        role = s.get('role') or s.get('kind', '?')
+        if role in ('cloud', 'hunter'):
+            role_key = 'cloud' if role == 'cloud' else 'hunter'
+        elif role == 'filter':
+            role_key = 'filter'
+        elif role == 'judge':
+            role_key = 'judge'
+        elif role == 'fixer':
+            role_key = 'fixer'
+        else:
+            role_key = role
+        if role_key not in ROLE_ORDER:
+            continue
+        d = role_data.setdefault(role_key, {
+            'live_n': 0, 'busy_n': 0, 'idle_n': 0, 'done_n': 0,
+            'calls_total': 0, 'timeouts': 0, 'errors': 0,
+            'models': set(),
+        })
+        status = s.get('status', 'idle')
+        if status == 'done':
+            d['done_n'] += 1
+        elif status == 'busy':
+            d['live_n'] += 1
+            d['busy_n'] += 1
+        else:
+            d['live_n'] += 1
+            d['idle_n'] += 1
+        d['calls_total'] += s.get('calls', 0)
+        d['errors'] += s.get('errors', 0)
+        model = s.get('model', '')
+        if model and model != '?':
+            d['models'].add(model)
+    # Count quarantined models per role from HEALTH
+    roles_out = []
+    for role_key in ROLE_ORDER:
+        d = role_data.get(role_key, {
+            'live_n': 0, 'busy_n': 0, 'idle_n': 0, 'done_n': 0,
+            'calls_total': 0, 'timeouts': 0, 'errors': 0,
+            'models': set(),
+        })
+        calls_total = d['calls_total']
+        calls_per_min = round(calls_total / (uptime / 60.0), 2) if uptime > 0 else 0.0
+        roles_out.append({
+            'role': role_key,
+            'label': LABELS.get(role_key, role_key),
+            'configured_n': CONFIGURED.get(role_key, 0),
+            'live_n': d['live_n'],
+            'busy_n': d['busy_n'],
+            'idle_n': d['idle_n'],
+            'done_n': d['done_n'],
+            'quarantined_n': sum(1 for m in d['models'] if m in q_set),
+            'calls_total': calls_total,
+            'calls_per_min': calls_per_min,
+            'timeouts': d['timeouts'],
+            'errors': d['errors'],
+            'models': sorted(d['models']),
+        })
+    return roles_out
+
+
+def _build_nodes() -> list:
+    """Construye la lista nodes[] para el schema v2.
+
+    Primero intenta leer /tmp/harness-fleet.json (escrito por fleet.py en Fase C);
+    si no existe, produce un esqueleto local con /api/ps.
+    """
+    fleet_path = Path('/tmp/harness-fleet.json')
+    if fleet_path.exists():
+        try:
+            raw = json.loads(fleet_path.read_text())
+            nodes_out = []
+            for n in raw.get('nodes', []):
+                gpus_out = []
+                for g in n.get('gpus', []):
+                    gpus_out.append({
+                        'index': g.get('index', 0),
+                        'name': g.get('name', '?'),
+                        'vram_used_mib': g.get('vram_total_mib', 0) - g.get('vram_free_mib', 0),
+                        'vram_total_mib': g.get('vram_total_mib', 0),
+                        'util_pct': g.get('util_pct', 0),
+                        'loaded_models': [g['assigned_model']] if g.get('assigned_model') else [],
+                    })
+                ollama_models = []
+                for model_name, vram_mib in n.get('running', {}).items():
+                    ollama_models.append({
+                        'name': model_name,
+                        'vram_gb': round(vram_mib / 1024, 2),
+                        'gpu_index': None,
+                    })
+                nodes_out.append({
+                    'id': n.get('name', 'local'),
+                    'host': n.get('base_url', '').replace('http://', '').replace('https://', ''),
+                    'alive': n.get('online', False),
+                    'latency_ms': 0,
+                    'gpus': gpus_out,
+                    'ollama_models': ollama_models,
+                })
+            return nodes_out
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    # Fallback: local skeleton via /api/ps
+    base = os.environ.get('LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+    ollama_models = []
+    latency_ms = 0
+    alive = False
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(f'{base}/api/ps', timeout=3) as r:
+            latency_ms = int((time.time() - t0) * 1000)
+            alive = True
+            data = json.loads(r.read().decode('utf-8'))
+        for m in data.get('models', []) or []:
+            name = (m.get('name') or '').strip()
+            size_vram = int(m.get('size_vram', 0) or 0)
+            if name:
+                ollama_models.append({
+                    'name': name,
+                    'vram_gb': round(size_vram / 1e9, 2),
+                    'gpu_index': None,
+                })
+    except Exception:
+        pass
+    return [{
+        'id': 'local',
+        'host': base.replace('http://', '').replace('https://', ''),
+        'alive': alive,
+        'latency_ms': latency_ms,
+        'gpus': [],
+        'ollama_models': ollama_models,
+    }]
+
+
 def write_status() -> None:
-    """Volca el estado para /tmp/loop-v6-status.json (TUI / debug)."""
+    """Volca el estado para /tmp/loop-v6-status.json (TUI / debug). Schema v2."""
+    threads_raw = get_thread_states()
+    threads_v2 = []
+    for s in threads_raw:
+        threads_v2.append({
+            'name': s.get('name', '?'),
+            'role': s.get('role') or s.get('kind', '?'),
+            'location': s.get('location', 'local'),
+            'node': s.get('node', 'local'),
+            'model': s.get('model', '?'),
+            'status': s.get('status', 'idle'),
+            'current_file': s.get('current_file', ''),
+            'current_task': s.get('current_task', ''),
+            'calls': s.get('calls', 0),
+            'errors': s.get('errors', 0),
+            'avg_ms': s.get('avg_ms', 0),
+            'age_sec': s.get('age_sec', 0),
+            'idle_sec': s.get('idle_sec', 0),
+        })
     payload = {
-        'stats': STATS,
+        'schema_version': 2,
+        'ts': time.time(),
+        'pid': os.getpid(),
         'uptime_sec': int(time.time() - STATS['started_at']),
-        'quota': quota.local_spend(),
-        'threads': get_thread_states(),
+        'funnel': {
+            'suspects_produced': STATS.get('suspects_produced', 0),
+            'suspects_refuted': STATS.get('suspects_refuted_by_filter', 0),
+            'suspects_known_fp': STATS.get('suspects_filtered_as_known_fp', 0),
+            'bugs_confirmed': STATS.get('bugs_confirmed', 0),
+            'fixes_attempted': STATS.get('fixes_attempted', 0),
+            'fixes_succeeded': STATS.get('fixes_succeeded', 0),
+            'fixes_reverted': STATS.get('fixes_reverted', 0),
+            'fixes_to_review': STATS.get('fixes_to_review', 0),
+            'e2e_findings': STATS.get('e2e_findings', 0),
+            'opus_invocations': STATS.get('opus_invocations', 0),
+            'rounds': STATS.get('rounds', 0),
+            'clean_rounds_in_a_row': STATS.get('clean_rounds_in_a_row', 0),
+        },
+        'roles': _build_roles(),
+        'threads': threads_v2,
         'orchestrator': {
             'model': orchestrator.ORCHESTRATOR_MODEL,
-            'hunting_prompts': len(_current_orch_prompts),
-            'e2e_journeys': len(_current_e2e_journeys) if _current_e2e_journeys else 0,
+            # FIX crash TUI: int directo con sufijo _n (NO hacer len() sobre esto)
+            'hunting_prompts_n': len(_current_orch_prompts),
+            'e2e_journeys_n': len(_current_e2e_journeys) if _current_e2e_journeys else 0,
+            'ready': True,
         },
+        'nodes': _build_nodes(),
+        'quota': quota.local_spend(),
         'memory': {
             'total_rounds': MEM.total_rounds,
             'total_bugs_found': MEM.total_bugs_found,
             'total_fixes_applied': MEM.total_fixes_applied,
             'open_bugs': len(MEM.open_bugs()),
             'hardened_zones': sum(1 for z in MEM.zones.values() if z.clean_rounds >= 3),
+        },
+        # Backward compat: keep 'stats' so existing stats tab in TUI still works
+        'stats': {
+            'rounds': STATS.get('rounds', 0),
+            'clean_rounds_in_a_row': STATS.get('clean_rounds_in_a_row', 0),
+            'suspects_produced': STATS.get('suspects_produced', 0),
+            'suspects_refuted_by_filter': STATS.get('suspects_refuted_by_filter', 0),
+            'suspects_filtered_as_known_fp': STATS.get('suspects_filtered_as_known_fp', 0),
+            'bugs_confirmed': STATS.get('bugs_confirmed', 0),
+            'fixes_attempted': STATS.get('fixes_attempted', 0),
+            'fixes_succeeded': STATS.get('fixes_succeeded', 0),
+            'fixes_reverted': STATS.get('fixes_reverted', 0),
+            'fixes_to_review': STATS.get('fixes_to_review', 0),
+            'e2e_findings': STATS.get('e2e_findings', 0),
+            'opus_invocations': STATS.get('opus_invocations', 0),
         },
     }
     try:
@@ -1175,7 +1387,11 @@ def fixer_worker(bug: Bug) -> None:
                             model='?', status='busy',
                             current_file=bug.suspect.file, calls=1)
 
-        fixers = quota.filter_tier(tiers.get_tier3_fixers(), 'fixer')
+        fixers = list(quota.filter_tier(tiers.get_tier3_fixers(), 'fixer'))
+        # Fixer LOCAL del fleet primero (30B en GPU0, con base_url/gpu/num_ctx resueltos).
+        if FLEET is not None and FLEET.fixer_spec() is not None:
+            fx = FLEET.fixer_spec()
+            fixers = [fx] + [f for f in fixers if f.id != fx.id]
         if not fixers:
             log('  [fixer] no hay fixers disponibles (todos en cuarentena)')
             update_thread_state(f'fixer-{bug.suspect.file}', status='done', current_task='sin fixers')
@@ -1528,9 +1744,14 @@ def watchdog() -> None:
         elif time.time() - last_progress > STALL_SECS:
             log(f'  [watchdog] stall {STALL_SECS}s sin avance; descargando Ollama')
             try:
-                # Forzar unload de modelos pesados.
-                for model_name in ('qwen3-coder:30b', 'qwen3.5:9b'):
-                    base = os.environ.get('LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
+                # Forzar unload de los modelos del fleet (por nodo) para liberar VRAM.
+                default_base = os.environ.get('LOOP_OLLAMA_BASE') or 'http://host.docker.internal:11434'
+                if FLEET is not None:
+                    unload = [(getattr(s, 'base_url', None) or default_base, s.id.split(':', 1)[1])
+                              for s in FLEET.all_specs()]
+                else:
+                    unload = [(default_base, 'qwen3-coder:30b'), (default_base, 'qwen3.5:9b')]
+                for base, model_name in unload:
                     try:
                         req = urllib.request.Request(
                             f'{base}/api/generate',
@@ -1648,8 +1869,17 @@ def main() -> None:
     seed_quarantine()
 
     # Cargar tiers filtrados por cuota.
-    hunter_specs = quota.filter_tier(tiers.get_tier0_hunters(), 'tier0') or list(tiers.TIER0_HUNTERS)
-    second_specs = quota.filter_tier(tiers.get_tier0_30b(), 'tier0') or list(tiers.TIER0_30B_OPINIONS)
+    # Fleet: descubre GPUs/nodos y planifica el modelo por VRAM (Fase B/C). Los
+    # hunters locales y el fixer local salen del fleet (incl. la RTX 2060 antes
+    # ociosa). Health-loop en daemon escribe /tmp/harness-fleet.json para la TUI.
+    global FLEET
+    FLEET = fleet.build_fleet()
+    fleet.write_fleet_status(FLEET)
+    fleet.start_health_loop(FLEET, shutdown)
+    log(f'  Fleet: {[(getattr(s, "node", None), getattr(s, "gpu_index", None), s.id) for s in FLEET.all_specs()]}')
+
+    hunter_specs = FLEET.hunter_specs() or quota.filter_tier(tiers.get_tier0_hunters(), 'tier0') or list(tiers.TIER0_HUNTERS)
+    second_specs = FLEET.reasoner_specs() or quota.filter_tier(tiers.get_tier0_30b(), 'tier0') or list(tiers.TIER0_30B_OPINIONS)
     cloud_hunter_specs = quota.filter_tier(tiers.get_tier0_cloud_hunters(), 'tier0') or list(tiers.TIER0_CLOUD_HUNTERS)
     filter_specs = quota.filter_tier(tiers.get_tier1_filters(), 'tier1') or list(tiers.TIER1_FILTERS)
     judge_specs = quota.filter_tier(tiers.get_tier2_judges(), 'tier2')[:JUDGE_TOTAL] or list(tiers.TIER2_JUDGES[:JUDGE_TOTAL])

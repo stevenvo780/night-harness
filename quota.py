@@ -56,11 +56,33 @@ DEFAULT_LIMITS = {
     # Minimax-M3: sin límite explícito en el dashboard; siempre OK.
 }
 
+# Fallback: tokens absolutos cuando `ai-usage.sh` no devuelve `pct_used`.
+# El porcentaje se calcula como (tokens / PROXY_LIMITS[model]) * 100.
+# Si el plan real difiere, ajustar aquí o sobrescribir `is_model_ok`/`_remaining_pct`.
+PROXY_LIMITS: dict[str, int] = {
+    'claude-sonnet-4-5': 50_000_000,
+    'claude-sonnet-4-6': 50_000_000,
+    'claude-opus-4-6': 10_000_000,
+    'claude-haiku-4-5': 100_000_000,
+    'codex-mini': 30_000_000,
+    'gemini-2.5-pro': 50_000_000,
+    'gemini-2.5-flash': 200_000_000,
+    'gemini-2.5-flash-lite': 500_000_000,
+    'gemini-3-pro-preview': 50_000_000,
+    'gemini-3-flash-preview': 200_000_000,
+}
+DEFAULT_PROXY_LIMIT: int = 50_000_000
+
 
 @dataclass
 class QuotaState:
     """Estado en vivo de las cuotas de todos los proveedores."""
     timestamp: float = 0.0
+    last_refresh_started: float = 0.0
+    """Sentinel: timestamp del INICIO del último refresh. Usado por `refresh()`
+    para evitar que dos hilos ejecuten el subprocess en paralelo dentro de la
+    ventana de 60s.
+    """
     by_model_pct: dict[str, dict[str, float]] = field(default_factory=dict)
     """Por modelo: { 'claude-sonnet-4-6': {'daily': 0, 'weekly': 78, 'session': 12}, ... }"""
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -139,33 +161,61 @@ def _extract_pct(ai_data: dict) -> dict[str, dict[str, float]]:
             + mb.get('outputTokens', 0)
         )
         eff_week = weekly_by_model.get(name, 0)
-        by_model[name] = {
+        info: dict[str, float] = {
             'daily_tokens': eff_today,
             'weekly_tokens': eff_week,
             # pct = 0 si no hay límite conocido.
             'daily': 0.0,
             'weekly': 0.0,
         }
+        # Si el dashboard expone `pct_used` por modelo, lo guardamos: es la
+        # fuente de verdad (no requiere conocer el límite absoluto del plan).
+        if 'pct_used' in mb:
+            try:
+                info['pct_used'] = float(mb['pct_used'])
+            except (TypeError, ValueError):
+                pass
+        by_model[name] = info
 
     return by_model
 
 
 def refresh(force: bool = False) -> QuotaState:
-    """Refresca el estado desde ai-usage-live (con cache de 60s por defecto)."""
+    """Refresca el estado desde ai-usage-live (con cache de 60s por defecto).
+
+    Thread-safe: usa `last_refresh_started` como sentinel. El primer hilo
+    toma el lock, marca el timestamp de INICIO y suelta el lock; los hilos
+    que lleguen dentro de la ventana de 60s ven que ya hay un refresh en
+    curso (o recién terminado) y retornan sin volver a ejecutar el
+    subprocess. El subprocess corre FUERA del lock para no bloquear a
+    lectores concurrentes.
+    """
     with _STATE.lock:
-        if not force and _STATE.is_fresh():
+        now = time.time()
+        if not force and (now - _STATE.last_refresh_started) < 60:
             return _STATE
-        daily = _run_ai_usage(['daily'])
-        weekly = _run_ai_usage(['weekly'])
-        new_by_model = _extract_pct(daily)
-        weekly_by_model = _extract_pct(weekly)
-        # Combinar daily + weekly.
-        for model_name, info in new_by_model.items():
-            wk = weekly_by_model.get(model_name, {})
-            info['weekly'] = wk.get('weekly_tokens', 0)
-        _STATE.by_model_pct = new_by_model
+        _STATE.last_refresh_started = now
+
+    # Subprocess fuera del lock: no bloquea a otros lectores.
+    daily = _run_ai_usage(['daily'])
+    weekly = _run_ai_usage(['weekly'])
+    new_by_model = _extract_pct(daily)
+    weekly_by_model = _extract_pct(weekly)
+    # Combinar daily + weekly.
+    for model_name, info in new_by_model.items():
+        wk = weekly_by_model.get(model_name, {})
+        info['weekly'] = wk.get('weekly_tokens', 0)
+        if 'pct_used' in wk and 'pct_used' not in info:
+            info['pct_used'] = wk['pct_used']
+
+    with _STATE.lock:
+        # No pisar datos válidos con {} si `ai-usage.sh` falló (devolvió vacío):
+        # eso desactivaría el control de cuota en silencio. Solo reemplazar si
+        # hay datos nuevos, o si nunca tuvimos datos.
+        if new_by_model or not _STATE.by_model_pct:
+            _STATE.by_model_pct = new_by_model
         _STATE.timestamp = time.time()
-        return _STATE
+    return _STATE
 
 
 # ---------------------------------------------------------------------------
@@ -184,14 +234,20 @@ def _model_id_to_ai_usage_id(spec_id: str) -> str:
 
 
 def _normalize_model_name(name: str) -> str:
-    """Quita prefijos de versión (ej. '-20250514') que el dashboard ignora."""
+    """Quita prefijos de versión (ej. '-20250514') que el dashboard ignora.
+
+    NO toca el `:` (un id Ollama como `qwen3-coder:30b` usa `:` para el tag de
+    tamaño, no para un prefijo de proveedor). El pelado del prefijo de proveedor
+    (`claude:`, `gemini:`, ...) lo hace `_model_id_to_ai_usage_id` en los call
+    sites de cuota, donde los modelos locales ya fueron corto-circuitados.
+    """
     import re
     return re.sub(r'-\d{8}$', '', name)
 
 
 def get_limit(model_id: str, period: str) -> Optional[float]:
     """Devuelve el límite configurado para el modelo/periodo, o None."""
-    normalized = _normalize_model_name(model_id)
+    normalized = _normalize_model_name(_model_id_to_ai_usage_id(model_id))
     cfg = DEFAULT_LIMITS.get(normalized)
     if not cfg:
         return None
@@ -228,7 +284,7 @@ def is_model_ok(model_id: str) -> bool:
         return True
 
     state = refresh()
-    normalized = _normalize_model_name(model_id)
+    normalized = _normalize_model_name(_model_id_to_ai_usage_id(model_id))
     info = state.by_model_pct.get(normalized, {})
     if not info:
         # Modelo sin tracking (ej. Minimax, Codex si no está en logs) → OK.
@@ -237,20 +293,7 @@ def is_model_ok(model_id: str) -> bool:
         limit = get_limit(normalized, period)
         if not limit:
             continue
-        tokens = info.get(f'{period}_tokens', 0)
-        proxy_limit = {
-            'claude-sonnet-4-5': 50_000_000,
-            'claude-sonnet-4-6': 50_000_000,
-            'claude-opus-4-6': 10_000_000,
-            'claude-haiku-4-5': 100_000_000,
-            'codex-mini': 30_000_000,
-            'gemini-2.5-pro': 50_000_000,
-            'gemini-2.5-flash': 200_000_000,
-            'gemini-2.5-flash-lite': 500_000_000,
-            'gemini-3-pro-preview': 50_000_000,
-            'gemini-3-flash-preview': 200_000_000,
-        }.get(normalized, 50_000_000)
-        pct = (tokens / proxy_limit) * 100
+        pct = _pct_used_for(info, period, normalized)
         if pct >= limit:
             return False
     return True
@@ -278,7 +321,7 @@ def _remaining_pct(model_id: str) -> float:
     if model_id.startswith('ollama:') or model_id.startswith('opencode:'):
         return 100.0
     state = refresh()
-    normalized = _normalize_model_name(model_id)
+    normalized = _normalize_model_name(_model_id_to_ai_usage_id(model_id))
     info = state.by_model_pct.get(normalized, {})
     if not info:
         return 100.0
@@ -288,23 +331,27 @@ def _remaining_pct(model_id: str) -> float:
         limit = get_limit(normalized, period)
         if not limit:
             continue
-        tokens = info.get(f'{period}_tokens', 0)
-        proxy_limit = {
-            'claude-sonnet-4-5': 50_000_000,
-            'claude-sonnet-4-6': 50_000_000,
-            'claude-opus-4-6': 10_000_000,
-            'claude-haiku-4-5': 100_000_000,
-            'codex-mini': 30_000_000,
-            'gemini-2.5-pro': 50_000_000,
-            'gemini-2.5-flash': 200_000_000,
-            'gemini-2.5-flash-lite': 500_000_000,
-            'gemini-3-pro-preview': 50_000_000,
-            'gemini-3-flash-preview': 200_000_000,
-        }.get(normalized, 50_000_000)
-        pct_used = (tokens / proxy_limit) * 100
+        pct_used = _pct_used_for(info, period, normalized)
         pct_remaining = max(0.0, limit - pct_used)
         worst = min(worst, pct_remaining)
     return worst
+
+
+def _pct_used_for(info: dict, period: str, normalized: str) -> float:
+    """Devuelve el % de cuota usada por el modelo en el periodo dado.
+
+    Prioridad:
+      1. `pct_used` directo del dashboard (si está presente en la info).
+      2. Fallback: (tokens / PROXY_LIMITS[model]) * 100.
+    """
+    direct = info.get('pct_used')
+    if direct is not None:
+        return float(direct)
+    tokens = info.get(f'{period}_tokens', 0)
+    proxy_limit = PROXY_LIMITS.get(normalized, DEFAULT_PROXY_LIMIT)
+    if not proxy_limit:
+        return 0.0
+    return (tokens / proxy_limit) * 100
 
 
 def smart_pick(specs: tuple, role: str) -> Optional['tiers.ModelSpec']:

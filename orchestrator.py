@@ -87,6 +87,12 @@ ORCHESTRATOR_MODEL = os.environ.get(
     'minimax/MiniMax-M3',  # 1M ctx, barato, fiable (yo mismo). GLM-5.2 era caro.
 )
 
+# Path del cache de prompts/journeys. Override por env: LOOP_ORCH_CACHE.
+DEFAULT_CACHE_PATH = os.environ.get(
+    'LOOP_ORCH_CACHE',
+    '/tmp/orch-prompts.json',
+)
+
 # Cuánto contexto del proyecto pasar al modelo (en líneas).
 # 1M tokens ≈ 750K líneas de código; con 5000 líneas tenemos sobra.
 MAX_SNAPSHOT_LINES = 8000
@@ -125,8 +131,8 @@ def _scan_schema(subdir: str) -> str:
     """Lee el schema.ts (primeros 300 líneas)."""
     candidates = [
         Path(subdir) / 'lib/db/schema.ts',
-        Path(subdir) / 'lib/db/schema.ts',
-        Path(subdir) / 'lib/db/schema.ts',
+        Path(subdir) / 'db/schema.ts',
+        Path(subdir) / 'src/db/schema.ts',
     ]
     for c in candidates:
         if c.exists():
@@ -379,11 +385,14 @@ def call_orchestrator(snapshot: str, timeout: int = 120) -> Optional[dict]:
 def generate_hunting_prompts(
     worktree: str,
     subdir: str,
-    cache_path: Optional[str] = '/tmp/orch-prompts.json',
+    cache_path: Optional[str] = DEFAULT_CACHE_PATH,
 ) -> list[HuntingPrompt]:
     """Genera prompts de caza dirigidos a partir del proyecto.
 
     Usa cache: si ya existe un archivo JSON de <1h, lo reutiliza.
+    `cache_path` por defecto viene de `LOOP_ORCH_CACHE` o
+    `/tmp/orch-prompts.json`. Pasar `None` explícitamente desactiva
+    el cache (los tests lo usan para forzar regeneración).
     """
     if cache_path and os.path.exists(cache_path):
         age = time.time() - os.path.getmtime(cache_path)
@@ -427,16 +436,18 @@ def generate_hunting_prompts(
         except (TypeError, KeyError):
             continue
 
-    # Guardar cache.
+    # Guardar cache (atomic write: tmp + os.replace).
     if cache_path and prompts:
         try:
-            with open(cache_path, 'w') as f:
+            tmp = cache_path + '.tmp'
+            with open(tmp, 'w') as f:
                 json.dump({
                     'hunting_prompts': [{'file': pp.file, 'line': pp.line,
                                           'reason': pp.reason, 'context': pp.context}
                                          for pp in prompts],
                     'e2e_journeys': result.get('e2e_journeys', []),
                 }, f, indent=2)
+            os.replace(tmp, cache_path)
         except OSError:
             pass
 
@@ -485,9 +496,14 @@ def _fallback_prompts(worktree: str, subdir: str) -> list[HuntingPrompt]:
 def generate_e2e_journeys(
     worktree: str,
     subdir: str,
-    cache_path: Optional[str] = '/tmp/orch-prompts.json',
+    cache_path: Optional[str] = DEFAULT_CACHE_PATH,
 ) -> list[E2EJourney]:
-    """Genera recorridos E2E multi-step complejos."""
+    """Genera recorridos E2E multi-step complejos.
+
+    `cache_path` por defecto viene de `LOOP_ORCH_CACHE` o
+    `/tmp/orch-prompts.json`. Pasar `None` explícitamente desactiva
+    el cache.
+    """
     prompts: list[E2EJourney] = []
     if cache_path and os.path.exists(cache_path):
         age = time.time() - os.path.getmtime(cache_path)

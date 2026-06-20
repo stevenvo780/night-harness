@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demeter-tui — wrapper para la TUI del harness v6
+# demeter-tui — wrapper para la TUI del harness v7
 # Compila un binario standalone (sin Python en runtime) en /usr/local/lib/demeter-tui/
 # y valida dependencias externas (opencode CLI, status files).
 #
@@ -17,12 +17,12 @@ PID_FILE="${PID_FILE:-/tmp/loop-v6.pid}"
 case "${1:-run}" in
     -h|--help|help)
         cat <<EOF
-demeter-tui — TUI del harness v6 (Deméter)
+demeter-tui — TUI del harness v7 (Deméter)
 
 Uso:
   demeter-tui                  Lanza la TUI (requiere TTY)
   demeter-tui check            Valida deps + binario (sin lanzar)
-  demeter-tui status           Muestra estado del harness v6 desde \$STATUS_FILE
+  demeter-tui status           Muestra estado del harness v7 desde \$STATUS_FILE
   demeter-tui path             Imprime path del binario
   demeter-tui version          Versión del wrapper + binario
   demeter-tui --help           Esta ayuda
@@ -71,14 +71,14 @@ EOF
         if [ -r "$STATUS_FILE" ]; then
             echo "      OK: $(wc -c < "$STATUS_FILE") bytes, modificado $(stat -c %y "$STATUS_FILE" 2>/dev/null || stat -f "%Sm" "$STATUS_FILE" 2>/dev/null)"
         else
-            echo "      AVISO: no existe. La TUI mostrará dashboard vacío (el harness v6 no está corriendo o no ha escrito status aún)."
+            echo "      AVISO: no existe. La TUI mostrará dashboard vacío (el harness v7 no está corriendo o no ha escrito status aún)."
         fi
         echo
         echo "[4/5] pid file en $PID_FILE"
         if [ -r "$PID_FILE" ]; then
             PID_VAL=$(cat "$PID_FILE" 2>/dev/null || echo "?")
             if [ "$PID_VAL" != "?" ] && kill -0 "$PID_VAL" 2>/dev/null; then
-                echo "      OK: harness v6 corriendo con PID $PID_VAL"
+                echo "      OK: harness v7 corriendo con PID $PID_VAL"
             else
                 echo "      AVISO: pid file existe pero proceso $PID_VAL no responde."
             fi

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-tiers.py — Definición de tiers y cadenas de modelos para el Harness v6 "Adaptativo".
+tiers.py — Definición de tiers y cadenas de modelos para el Harness v7 "Adaptativo".
 
-El v6 prioriza coste bajo y cadencia alta. Opus aparece SOLO como último recurso
+El v7 prioriza coste bajo y cadencia alta. Opus aparece SOLO como último recurso
 en el árbitro, y solo si (a) hay un fix riesgoso (toca dinero, stock, estado,
 auth), (b) los 3 árbitros anteriores discordaron o están en cuarentena, y
 (c) hay cuota de Claude disponible. Se imprime un banner de aviso al usuario

@@ -21,6 +21,7 @@ class TestQuotaConstants(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_default_limits_well_formed(self):
         """Toda entrada en DEFAULT_LIMITS tiene números positivos, nunca None."""
@@ -67,6 +68,7 @@ class TestModelOk(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_local_ollama_always_ok(self):
         """Modelos ollama:* son SIEMPRE OK (locales, sin quota)."""
@@ -194,6 +196,7 @@ class TestFilterTier(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def _specs(self):
         return (
@@ -257,6 +260,7 @@ class TestSmartPick(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_returns_single_spec(self):
         """Con un solo spec, lo devuelve."""
@@ -320,6 +324,7 @@ class TestRecordAndSpend(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_record_appends_to_call_log(self):
         """record añade una entrada con ts, model, in, out, eff."""
@@ -398,6 +403,7 @@ class TestReportAndBanner(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
         quota._OPUS_BANNER_PRINTED = False
 
     @patch('quota._run_ai_usage')
@@ -437,12 +443,17 @@ class TestRefresh(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     @patch('quota._run_ai_usage')
     def test_respects_cache_when_fresh(self, mock_run):
-        """Estado fresh (< 60s): refresh NO llama a _run_ai_usage."""
+        """Estado fresh (< 60s): refresh NO llama a _run_ai_usage.
+
+        El sentinel de frescura es `last_refresh_started` (no `timestamp`):
+        refleja cuándo arrancó el último refresh, no cuándo terminó.
+        """
         mock_run.return_value = {'daily': []}
-        quota._STATE.timestamp = time.time()
+        quota._STATE.last_refresh_started = time.time()
         quota.refresh()
         mock_run.assert_not_called()
 
@@ -478,6 +489,7 @@ class TestThreadSafety(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_record_thread_safe(self):
         """10 threads × 100 records = 1000 entries sin pérdida."""

@@ -6,7 +6,7 @@ arregla con **compuerta de typecheck + E2E real (navegador)**, todo **aislado en
 con el **merge a mano**. Pensado para correr toda la noche quemando cómputo local, sin gastar cuota
 de un modelo de pago.
 
-> Nace del proyecto **Deméter**. La config de `MODULES`/rutas es un ejemplo: adáptala a tu repo.
+> Nace del proyecto **Deméter**. Las rutas/zonas son un ejemplo: adáptalas a tu repo.
 
 ## Instalación (Linux)
 
@@ -24,8 +24,11 @@ bash install.sh
 3. `sudo cp` del binario a `/usr/local/lib/demeter-tui/demeter-tui-bin`.
 4. `sudo cp` del wrapper a `/usr/local/bin/demeter-tui`.
 
-Al final ejecuta `demeter-tui check` para validar 5 dependencias:
-binario, `opencode` CLI, status file, harness v6 corriendo, `ai-usage-live/`.
+Al final ejecuta `demeter-tui check` para validar 5 dependencias. **Solo el binario es
+estricto** (falla con exit 1 si falta); las otras 4 son advertencias (`AVISO`) y no
+bloquean: binario, `opencode` CLI, status file, pid del harness (corriendo o no),
+`ai-usage-live/`. Por eso `install.sh` puede correrlo durante la instalación, cuando
+el harness todavía no está activo.
 
 **Uso**:
 ```bash
@@ -75,9 +78,9 @@ Lecciones a fuego: el consenso del MISMO modelo chico NO sube precisión (sus fa
 (baja frecuencia), no para CAZAR a alta frecuencia. La solución: una **escalera de costo** con familias
 diversas en capas distintas, **desacoplada por colas**, consumiendo siempre lo más barato primero:
 
-## v6 "Adaptativo" — Cuota-Aware + Memoria Persistente + Cadencia Alta
+## v7 "Adaptativo" — Cuota-Aware + Memoria Persistente + Cadencia Alta
 
-El v6 reescrito completo (jul-2026) integra el repo
+El v7 (jul-2026, definido en `harness.py:3`) integra el repo
 [`ai-usage-live`](https://github.com/stevenvo780/ai-usage-live) para consumir el
 monitoreo de cuotas en vivo y planificar qué modelo usar en cada llamada. El
 hilo conductor es **minimizar Opus** (caro y escaso) y maximizar Minimax,
@@ -85,16 +88,21 @@ Gemini Flash, Sonnet y locales. Toda llamada del harness pasa por
 `quota.py`, que consulta `ai-usage.sh daily/weekly` (con cache 60s) y filtra
 los modelos cerca del límite antes de cada invocación.
 
-### Tier v6 (modelo → familia → rol → coste relativo 1-10)
+### Tier v7 (modelo → familia → rol → coste relativo 1-10)
 
 | Tier | Modelos (orden) | Rol | Frecuencia |
 |---|---|---|---|
-| **0 · Escáner local** | `ollama:qwen3-coder:30b` (GPU) + `ollama:qwen3-coder-next:cpu` (CPU) | caza sospechas | altísima, gratis |
-| **1 · Filtro** | `minimax:MiniMax-M3` → `gemini:gemini-2.5-flash-lite` → `claude:claude-haiku-4-5` + **5 free opencode** (`deepseek-v4-flash-free`, `north-mini-code-free`, `mimo-v2.5-free`, `big-pickle`, `nemotron-3-ultra-free`) | refuta ruido, promoción `suspectq → bugq` | media |
-| **2 · Jueces** | `minimax:MiniMax-M3` → `codex:gpt-5.5` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-5` + **3 opencode-go pro** (`kimi-k2.7-code`, `deepseek-v4-pro`, `glm-5.2`) | REAL vs NOT_A_BUG (quorum 2/3) | baja |
-| **3 · Fixer** | `codex:gpt-5.5` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-5` → `ollama:qwen3-coder:30b` + **3 opencode-go pro** (`qwen3.7-max`, `deepseek-v4-pro`, `kimi-k2.7-code`) | genera fix, gate `tsc`+E2E, commit | rara |
-| **4 · Árbitro** | `ollama:qwen3-coder:30b` → `claude:claude-sonnet-4-5` → `minimax:MiniMax-M3` → `gemini:gemini-2.5-pro` + **3 opencode-go pro** (`qwen3.7-max`, `glm-5.2`, `kimi-k2.7-code`) | veredicto final (SOLO riesgosos) | rarísima |
-| **4bis · Opus último recurso** | `claude:claude-opus-4-6` | solo si 4 falla o discordia | extrema |
+| **0 · Escáner local** (2) | `ollama:qwen3-coder:30b` (GPU) + `ollama:qwen3-coder-next:cpu` (CPU) | caza sospechas | altísima, gratis |
+| **1 · Filtro** (11) | `minimax/MiniMax-M3` → `minimax/MiniMax-M2.7-highspeed` → `minimax/MiniMax-M2.5-highspeed` → `gemini:gemini-2.5-flash-lite` → `gemini:gemini-3-flash-preview` → `claude:claude-haiku-4-5` + **5 free opencode** (`deepseek-v4-flash-free`, `north-mini-code-free`, `mimo-v2.5-free`, `big-pickle`, `nemotron-3-ultra-free`) | refuta ruido, promoción `suspectq → bugq` | media |
+| **2 · Jueces** (8) | `minimax/MiniMax-M3` → `gemini:gemini-2.5-pro` → `gemini:gemini-3-pro-preview` → `codex:gpt-5.5` → `claude:claude-sonnet-4-5` + **3 opencode-go pro** (`kimi-k2.7-code`, `deepseek-v4-pro`, `glm-5.2`) | REAL vs NOT_A_BUG (quorum 2/3) | baja |
+| **3 · Fixer** (8) | `codex:gpt-5.5` → `minimax/MiniMax-M3` → `gemini:gemini-2.5-pro` → `claude:claude-sonnet-4-5` → `ollama:qwen3-coder:30b` + **3 opencode-go pro** (`qwen3.7-max`, `deepseek-v4-pro`, `kimi-k2.7-code`) | genera fix, gate `tsc`+E2E, commit | rara |
+| **4 · Árbitro** (7) | `ollama:qwen3-coder:30b` → `claude:claude-sonnet-4-5` → `minimax/MiniMax-M3` → `gemini:gemini-2.5-pro` + **3 opencode-go pro** (`qwen3.7-max`, `glm-5.2`, `kimi-k2.7-code`) | veredicto final (SOLO riesgosos) | rarísima |
+| **4bis · Opus último recurso** (1) | `claude:claude-opus-4-6` | solo si 4 falla o discordia | extrema |
+
+> Definiciones exactas en `tiers.py:88-566` (`TIER0_HUNTERS`, `TIER1_FILTERS`,
+> `TIER2_JUDGES`, `TIER3_FIXERS`, `TIER4_ARBITERS`, `TIER4_OPUS_LAST_RESORT`).
+> Cada tier es una tupla inmutable de `ModelSpec`; `quota.py` decide cuál probar
+> primero según `ai-usage.sh` en vivo.
 
 #### OpenCode-go provider (jul-2026, 13 modelos)
 
@@ -110,11 +118,12 @@ el harness**: la key está en `API_KEY` env var y opencode la consume.
   fuerte), `opencode-go:glm-5.2` (Z.ai 1M context), `opencode-go:qwen3.7-max`
   (Alibaba top de gama). Calidad/precio competitivas vs Sonnet/Opus.
 
-Total pool: **38 modelos** (1 local GPU + 1 local CPU + 11 filtro + 8 juez +
-8 fixer + 7 árbitro + 1 Opus + 1 minimax-m3) — diversidad amplia para
-consenso, cadencia alta, coste dominado por local/free.
+Total pool: **22 modelos únicos** (2 tier-0 + 11 tier-1 + 8 tier-2 + 8 tier-3 + 7
+tier-4 + 1 Opus = 37 membresías de tier, con reutilización: M3 aparece en 4 tiers,
+30b y Sonnet en 3 cada uno) — diversidad amplia para consenso, cadencia alta,
+coste dominado por local/free.
 
-### Política Opus (v6)
+### Política Opus (v7)
 
 Opus aparece SOLO si se cumplen LAS 3 condiciones:
 1. **El fix es riesgoso** (`tiers.is_risky_path`): toca dinero, stock, estado, auth, despacho, factura, caja, permiso, admin.
@@ -203,7 +212,8 @@ cuenta como "carga", es page-fault). Con los hunters (9B) interleaveando entre c
 resolver (80B), **cada request del resolver esperaba 67s+ → timeout → reintento → más cola → wedge.**
 
 **Mitigaciones (ya en el código):**
-- **Por defecto, hunter y resolver usan el MISMO modelo chico** → cero contención. (`LOOP_RESOLVER`)
+- **Por defecto, hunter y resolver usan el MISMO modelo chico** → cero contención.
+  (Override por tier: `LOOP_TIER0_HUNTERS`, `LOOP_TIER3_FIXERS` en `tiers.py`.)
 - **Sin reintento tras timeout** (reintentar encola otra generación y empeora la cola).
 - **Converge-and-stop** (no quemar cómputo re-validando código limpio).
 
@@ -218,7 +228,8 @@ una fase "solo-fix" con el grande sin interleave con el chico. No los alternes r
 - **Ollama** con un modelo chico de código para el CAZADOR (`qwen3.5:9b`).
 - **CLIs de modelos fuertes DIVERSOS** (v3, recomendado): `gemini` (juez/revisor) + `codex` (fixer),
   cada uno en su CAPA → no duplica cuota. Remotos → **cero contención** con el 9B local. `claude` CLI
-  también enchufable. Sin ellos, todo cae al local (`LOOP_FIXER=ollama:<modelo>`, `LOOP_JUDGES=ollama:<modelo>`).
+  también enchufable. Sin ellos, todo cae al local (`LOOP_TIER3_FIXERS=ollama:<modelo>`,
+  `LOOP_TIER2_JUDGES=ollama:<modelo>`).
 - El **repo objetivo** (Next.js + TypeScript + Drizzle, o adapta) con `npm run typecheck`/`build`.
 - **DB de test AISLADA** (Postgres local con el esquema completo) para el dev server del E2E — NUNCA
   apuntes el E2E a producción (muta datos). Playwright + chromium instalados.
@@ -240,35 +251,93 @@ LOOP_WT=/tmp/wt LOOP_SUBDIR=apps/dashboard LOOP_DYNAMIC_ID=<un-id-real-de-tu-db-
 
 ### Configuración (env vars)
 
+Lista verificada contra `grep os.environ.get harness.py quota.py fleet.py tiers.py`.
+Defaults entre paréntesis. Las vars marcadas `(*)` son overrides de tier (lista CSV).
+
+#### Generales
 | Var | Default | Qué |
 |---|---|---|
-| `LOOP_BASE` | `http://host.docker.internal:11434` | endpoint de Ollama |
-| `LOOP_HUNTER` | `qwen3.5:9b` | **escáner LOCAL** (tier 0, HTTP rápido/gratis) |
-| `LOOP_SCANNERS` | `4` | hilos del escáner local (corre a FULL) |
-| `LOOP_CONSENSUS` | `3` | muestras de auto-consistencia del escáner (1 si el cazador es fiable) |
-| **`LOOP_CHIQUITOS`** | `claude:haiku,gemini:gemini-2.5-flash` | **filtro/caza** (tier 1): filtran las sospechosas |
-| `LOOP_CHIQUITO_HILOS` | `2` | hilos chiquitos (consumen `suspectq`) |
-| `LOOP_SUSPECT_MAX` | `50` | runway del local (cola de sospechosas) |
-| **`LOOP_JUDGES`** | `gemini-3-pro, codex, sonnet, 30b-local` | **jueces fuertes** (tier 2); orden = escalera barato→caro |
-| `LOOP_JUDGE_MIN` | `2` | votos REAL para confirmar |
-| **`LOOP_FIXER`** | `codex, gemini-3-pro, sonnet, 30b-local` | **cadena fixer** (tier 3) con fallback |
-| `LOOP_REVIEWER` | `gemini-3-pro, sonnet` | revisor de fixes riesgosos (cadena) |
-| **`LOOP_ARBITER`** | `opus, gemini-3-pro, sonnet` | 🏆 **árbitro** (tier 4), cadena con fallback |
-| `LOOP_QUOTA_COOLDOWN` | `1800` | cuarentena (s) de un proveedor agotado antes de reintentar |
+| `LOOP_WT` | `/tmp/demeter-loop` | git worktree aislado (rama desechable) |
+| `LOOP_SUBDIR` | `apps/dashboard` | subdir del proyecto dentro del worktree |
+| `LOOP_HOURS` | `8` | deadline duro (h) |
 | `LOOP_TARGET` | `50` | rondas limpias para "endurecer" un módulo |
-| `LOOP_HOURS` | `8` | deadline duro |
+| `LOOP_LOG` | `/tmp/loop-v6.log` | path del log (mantiene nombre v6 por compat) |
 | `LOOP_DEV_URL` | `http://localhost:3011` | dev server para el crawl E2E |
-| `LOOP_WT` | `/tmp/wt` | git worktree aislado (rama desechable) |
-| `LOOP_SUBDIR` | `` (raíz) | subdir del proyecto en el worktree, p.ej. `apps/dashboard` |
 | `LOOP_STORAGE_STATE` | `` | `storageState.json` de Playwright (sesión autenticada); vacío = modo demo |
 | `LOOP_DYNAMIC_ID` | `` | id sembrado para crawl de rutas `[id]` (vacío = se omiten) |
-| `LOOP_BIG_RESOLVER` | `0` | `1` si el resolver es grande → espera disponibilidad con backoff antes de cada fix |
+
+#### Concurrencia / hilos
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_HUNTERS` | `4` | hilos tier-0 locales (hunter pool) |
+| `LOOP_SECOND_HILOS` | `2` | hilos second-opinion 30b |
+| `LOOP_CLOUD_HUNTERS` | `6` | hilos cloud hunters (tier 0 cloud) |
+| `LOOP_FILTER_HILOS` | `6` | hilos tier-1 filtros |
+| `LOOP_JUDGE_HILOS` | `3` | hilos tier-2 jueces |
+| `LOOP_FIXER_HILOS` | `1` | hilos tier-3 fixer |
+| `LOOP_E2E_WORKERS` | `8` | workers E2E en paralelo |
 | `LOOP_E2E_ACTIONS` | `24` | interacciones máximas por ruta (forms/botones/modales) |
 | `LOOP_E2E_BUDGET_MS` | `70000` | presupuesto de crawl profundo por ruta |
-| `LOOP_STALL_SECS` | `360` | watchdog: sin avance N s → recuperación (libera modelos pesados de Ollama) |
 
-`MODULES` (para el cazador de CÓDIGO) se edita en `harness.py`. Las **rutas E2E se descubren solas**
-del directorio `app/` (App Router) — no hay que listarlas.
+#### Consenso / jueces
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_CONSENSUS` | `3` | muestras de auto-consistencia del escáner (1 si el cazador es fiable) |
+| `LOOP_FILTER_QUORUM` | `2` | votos filtro para ascender `suspectq → bugq` |
+| `LOOP_JUDGE_MIN` | `2` | votos REAL para confirmar |
+| `LOOP_JUDGE_TOTAL` | `3` | jueces totales que se invocan por sospechoso |
+
+#### Ollama / locales
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_OLLAMA_BASE` | `http://host.docker.internal:11434` | endpoint de Ollama |
+| `LOOP_OLLAMA_NUM_CTX` | `8192` | `num_ctx` enviado a Ollama |
+| `LOOP_OLLAMA_GPU_CONC` | `2` | concurrencia por GPU (`parallel` en /api/generate) |
+| `LOOP_OLLAMA_KEEP_ALIVE` | `10m` | `keep_alive` por request |
+| `LOOP_NODES` | `localhost=<LOOP_OLLAMA_BASE>` | fleet multi-host: `name=url,…` (fleet.py) |
+
+#### Cuotas / cuarentena / health
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_QUARANTINE_SECS` | `600` | cuarentena (s) tras N fallos seguidos (health) |
+| `LOOP_HEALTH_FAIL_THRESHOLD` | `3` | fallos seguidos antes de cuarentenar un modelo |
+| `LOOP_HEALTH_PROBE` | `0` | `1` para emitir probes de health adicionales |
+| `LOOP_INITIAL_QUARANTINE` | `gemini:gemini-3-flash-preview,gemini:gemini-2.5-flash-lite,minimax/MiniMax-M2.7-highspeed,opencode:mimo-v2.5-free` | seed de cuarentena al arranque (CSV) |
+
+#### Watchdog
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_STALL_SECS` | `600` | sin avance N s → libera modelos pesados de Ollama |
+
+#### E2E / autofix gate
+| Var | Default | Qué |
+|---|---|---|
+| `LOOP_AUTOFIX_ALL` | `0` | `1` para auto-fijear TODOS los confirmados (no solo high-sev / unanime) |
+| `LOOP_GATE_REQUIRE_E2E` | `0` | `1` para que el gate de fixer exija E2E passing (no solo `tsc`) |
+
+#### Overrides de tier `(*)` (CSV de IDs de modelo; orden = preferencia)
+| Var | Default (en `tiers.py`) |
+|---|---|
+| `LOOP_TIER0_HUNTERS` `(*)` | TIER0_HUNTERS (2 modelos: 30b GPU + 30b CPU) |
+| `LOOP_TIER0_30B` `(*)` | TIER0_30B_OPINIONS (second opinion) |
+| `LOOP_TIER0_CLOUD` `(*)` | TIER0_CLOUD_HUNTERS (8 modelos) |
+| `LOOP_TIER1_FILTERS` `(*)` | TIER1_FILTERS (11 modelos) |
+| `LOOP_TIER2_JUDGES` `(*)` | TIER2_JUDGES (8 modelos) |
+| `LOOP_TIER3_FIXERS` `(*)` | TIER3_FIXERS (8 modelos) |
+| `LOOP_TIER4_ARBITERS` `(*)` | TIER4_ARBITERS (7 modelos) |
+
+#### Otras
+| Var | Default | Qué |
+|---|---|---|
+| `AI_USAGE_DIR` | `/workspace/ai-usage-live` | path del repo `ai-usage-live` (lo lee `quota.py` para cache de cuotas) |
+| `MINIMAX_API_KEY` | `` | API key de Minimax (si no está en `~/.local/share/opencode/auth.json`) |
+| `MINIMAX_API_BASE` | `https://api.minimax.io/v1` | base URL de la API Minimax |
+
+Las **zonas de código** que cazan los hunters se descubren dinámicamente con
+`discover_code_zones()` (harness.py:2040): agrupa los `.ts`/`.tsx` bajo `app/(panel)/`
+y `lib/` por prefijo (límite 30 archivos por zona). No hay `MODULES` que editar a
+mano. Las **rutas E2E** también se descubren solas del directorio `app/`
+(App Router) — no hay que listarlas.
 
 ## Seguridad
 

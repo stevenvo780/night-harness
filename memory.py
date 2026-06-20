@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -46,6 +47,17 @@ def hash_suspect(file: str, line: int, snippet: str) -> str:
     """Hash estable de un sospechoso: archivo + línea + palabras del snippet."""
     text = f'{file}::{line}::' + ' '.join(snippet.split()[:8])
     return hashlib.sha1(text.encode()).hexdigest()[:16]
+
+
+def _quarantine_corrupt(path: Path, exc: Exception) -> None:
+    """Archiva un memory.json ilegible en `<name>.corrupt` y avisa por stderr,
+    en vez de borrar el historial en silencio (p.ej. tras un cambio de schema)."""
+    try:
+        corrupt = path.with_name(path.name + '.corrupt')
+        os.replace(path, corrupt)
+        print(f'[memory] {path} corrupto ({exc}); archivado en {corrupt}', file=sys.stderr)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -70,6 +82,7 @@ class FalsePositive:
     first_seen: float
     times_seen: int = 1
     reason: str = ''
+    last_seen: float = 0.0
 
 
 @dataclass
@@ -97,27 +110,31 @@ class Memory:
     # ---- Persistencia ----
     @classmethod
     def load(cls, path: Path = MEMORY_PATH) -> 'Memory':
-        if path.exists():
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-                mem = cls()
-                mem.bugs = {k: BugRecord(**v) for k, v in data.get('bugs', {}).items()}
-                mem.false_positives = {
-                    k: FalsePositive(**v) for k, v in data.get('false_positives', {}).items()
-                }
-                mem.zones = {
-                    k: ZoneHardness(**v) for k, v in data.get('zones', {}).items()
-                }
-                mem.total_rounds = data.get('total_rounds', 0)
-                mem.total_bugs_found = data.get('total_bugs_found', 0)
-                mem.total_fixes_applied = data.get('total_fixes_applied', 0)
-                mem.last_session_at = data.get('last_session_at', 0.0)
-                mem.last_session_summary = data.get('last_session_summary', '')
-                return mem
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass
-        return cls()
+        if not path.exists():
+            return cls()
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError('memory JSON root no es un objeto')
+            mem = cls()
+            mem.bugs = {k: BugRecord(**v) for k, v in data.get('bugs', {}).items()}
+            mem.false_positives = {
+                k: FalsePositive(**v) for k, v in data.get('false_positives', {}).items()
+            }
+            mem.zones = {
+                k: ZoneHardness(**v) for k, v in data.get('zones', {}).items()
+            }
+            mem.total_rounds = data.get('total_rounds', 0)
+            mem.total_bugs_found = data.get('total_bugs_found', 0)
+            mem.total_fixes_applied = data.get('total_fixes_applied', 0)
+            mem.last_session_at = data.get('last_session_at', 0.0)
+            mem.last_session_summary = data.get('last_session_summary', '')
+            return mem
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            # No perder el historial en silencio: archivar el corrupto y seguir.
+            _quarantine_corrupt(path, exc)
+            return cls()
 
     def save(self, path: Path = MEMORY_PATH) -> None:
         data = {
@@ -194,6 +211,7 @@ class Memory:
                 line=line,
                 snippet=snippet[:300],
                 first_seen=now,
+                last_seen=now,
                 reason=reason,
             )
             self.false_positives[h] = rec

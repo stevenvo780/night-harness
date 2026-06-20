@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tui.py — TUI interactiva del harness v6 (curses).
+tui.py — TUI interactiva del harness v7 (curses).
 
 Paneles:
   1. Header: estado del harness (PID, uptime, ronda, contadores).
@@ -38,13 +38,13 @@ USO:
 from __future__ import annotations
 
 import curses
-import json
 import os
-import re
 import subprocess
 import sys
 import time
-from collections import Counter, deque
+from collections import Counter
+
+from loop_harness import tui_core
 
 STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else '/tmp/loop-v6-status.json'
 LOG_FILE = sys.argv[2] if len(sys.argv) > 2 else '/tmp/loop-v6.log'
@@ -144,65 +144,7 @@ def init_colors() -> bool:
     return True
 
 
-class LogBuffer:
-    """Buffer circular de las últimas N líneas del log, con timestamps."""
-
-    def __init__(self, max_lines: int = LOG_LINES):
-        self.max = max_lines
-        self.lines: deque[tuple[float, str]] = deque(maxlen=max_lines)
-        self._cursor = 0  # posición en el buffer para scroll
-        self._last_size = 0
-
-    def append_msg(self, msg: str) -> None:
-        """Agrega un mensaje interno de la TUI al log con su timestamp."""
-        self.lines.append((time.time(), msg))
-
-    def update(self, path: str) -> bool:
-        """Lee el archivo y agrega las líneas nuevas. Retorna True si hubo cambios."""
-        try:
-            with open(path) as f:
-                # tail -n con seek eficiente.
-                f.seek(0, 2)
-                size = f.tell()
-                if size < self._last_size:
-                    # Archivo rotado, releer todo.
-                    self._last_size = 0
-                    self.lines.clear()
-                if size > self._last_size:
-                    f.seek(self._last_size)
-                    new = f.read()
-                    self._last_size = size
-                    added = 0
-                    for line in new.splitlines():
-                        # Parsear timestamp HH:MM:SS.
-                        m = re.match(r'\[(\d{2}):(\d{2}):(\d{2})\]', line)
-                        if m:
-                            now = time.localtime()
-                            try:
-                                ts = time.mktime((
-                                    now.tm_year, now.tm_mon, now.tm_mday,
-                                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                                    0, 0, 0,
-                                ))
-                            except (ValueError, OverflowError):
-                                ts = time.time()
-                        else:
-                            ts = time.time()
-                        self.lines.append((ts, line))
-                        added += 1
-                    return added > 0
-        except (OSError, FileNotFoundError):
-            return False
-        return False
-
-    def scroll_up(self, n: int = 1):
-        self._cursor = min(self._cursor + n, max(0, len(self.lines) - 1))
-
-    def scroll_down(self, n: int = 1):
-        self._cursor = max(0, self._cursor - n)
-
-    def reset_cursor(self):
-        self._cursor = 0
+LogBuffer = tui_core.LogBuffer
 
 
 def model_color(model_id: str) -> int:
@@ -226,213 +168,59 @@ def gray_attr() -> int:
 
 
 def model_family_short(model_id: str) -> str:
-    """Etiqueta corta para mostrar en la barra de cadencia."""
-    if model_id.startswith('ollama:qwen3.5:9b'):
-        return '9b'
-    if model_id.startswith('ollama:qwen3-coder:30b'):
-        return '30b'
-    if model_id.startswith('ollama:qwen3-coder-next:cpu'):
-        return '80b-cpu'
-    if model_id.startswith('minimax/MiniMax-M3'):
-        return 'mm-m3'
-    if model_id.startswith('minimax/MiniMax-M2.5-highspeed'):
-        return 'mm-m2.5hs'
-    if model_id.startswith('minimax/MiniMax-M2.7-highspeed'):
-        return 'mm-m2.7hs'
-    if model_id.startswith('gemini:gemini-2.5-flash-lite'):
-        return 'gem-fl'
-    if model_id.startswith('gemini:gemini-2.5-pro'):
-        return 'gem-pro'
-    if model_id.startswith('gemini:gemini-3-flash-preview'):
-        return 'gem-3fl'
-    if model_id.startswith('gemini:gemini-3-pro-preview'):
-        return 'gem-3pro'
-    if model_id.startswith('claude:claude-sonnet-4-5'):
-        return 'sonnet'
-    if model_id.startswith('claude:claude-haiku-4-5'):
-        return 'haiku'
-    if model_id.startswith('codex:gpt-5.5'):
-        return 'codex'
-    if model_id.startswith('claude:claude-opus-4-6'):
-        return 'opus'
-    # Truncar el prefijo.
-    return model_id.split(':')[-1].split('/')[-1][:14]
+    return tui_core.model_family_short(model_id)
 
 
 def read_status(path: str) -> dict:
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, FileNotFoundError):
-        return {}
-    sv = data.get('schema_version', 1)
-    if sv != SCHEMA_VERSION:
-        data['_schema_warning'] = f'schema {sv} != expected {SCHEMA_VERSION}'
-    return data
+    return tui_core.read_status(path, schema_version=SCHEMA_VERSION)
 
 
 def _safe_int(val, default: int = 0) -> int:
-    """Convierte val a int de forma segura. Nunca falla con TypeError."""
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return default
+    return tui_core.safe_int(val, default)
 
 
 def _read_harness_pid() -> int:
-    """Reads the harness PID safely, returning 0 if missing or invalid."""
-    try:
-        with open(HARNESS_PID_FILE, 'r') as f:
-            content = f.read().strip()
-            return int(content) if content else 0
-    except (FileNotFoundError, ValueError, OSError):
-        return 0
+    return tui_core.read_harness_pid(HARNESS_PID_FILE)
 
 
 def _safe_float(val, default: float = 0.0) -> float:
-    """Convierte val a float de forma segura. Nunca falla con TypeError."""
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return default
+    return tui_core.safe_float(val, default)
 
 
 def _safe_get_funnel(status: dict) -> dict:
-    """Devuelve funnel con defaults seguros. Soporta schema v1 (stats) y v2 (funnel)."""
-    f = status.get('funnel')
-    if isinstance(f, dict):
-        return f
-    # Fallback schema v1: leer de 'stats'
-    s = status.get('stats', {}) or {}
-    return {
-        'suspects_produced': _safe_int(s.get('suspects_produced', 0)),
-        'suspects_refuted': _safe_int(s.get('suspects_refuted_by_filter', 0)),
-        'suspects_known_fp': _safe_int(s.get('suspects_filtered_as_known_fp', 0)),
-        'bugs_confirmed': _safe_int(s.get('bugs_confirmed', 0)),
-        'fixes_attempted': _safe_int(s.get('fixes_attempted', 0)),
-        'fixes_succeeded': _safe_int(s.get('fixes_succeeded', 0)),
-        'fixes_reverted': _safe_int(s.get('fixes_reverted', 0)),
-        'fixes_to_review': _safe_int(s.get('fixes_to_review', 0)),
-        'e2e_findings': _safe_int(s.get('e2e_findings', 0)),
-        'opus_invocations': _safe_int(s.get('opus_invocations', 0)),
-        'rounds': _safe_int(s.get('rounds', 0)),
-        'clean_rounds_in_a_row': _safe_int(s.get('clean_rounds_in_a_row', 0)),
-    }
+    return tui_core.safe_get_funnel(status)
 
 
 def _safe_get_roles(status: dict) -> list:
-    """Devuelve roles[] o lista vacía."""
-    r = status.get('roles')
-    return r if isinstance(r, list) else []
+    return tui_core.safe_get_roles(status)
 
 
 def _safe_get_nodes(status: dict) -> list:
-    """Devuelve nodes[] o lista vacía."""
-    n = status.get('nodes')
-    return n if isinstance(n, list) else []
+    return tui_core.safe_get_nodes(status)
 
 
 def _safe_get_threads(status: dict) -> list:
-    """Devuelve threads[] o lista vacía."""
-    t = status.get('threads')
-    return t if isinstance(t, list) else []
+    return tui_core.safe_get_threads(status)
 
 
 def read_log_calls(path: str, window_sec: int = 30) -> Counter:
-    """Cuenta las llamadas por modelo en los últimos N segundos del log."""
-    cutoff = time.time() - window_sec
-    counts: Counter = Counter()
-    try:
-        with open(path) as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 200_000), 0)  # últimas ~200KB
-            for line in f:
-                m = re.match(r'\[(\d{2}):(\d{2}):(\d{2})\].*\[call\] (\S+) ', line)
-                if not m:
-                    continue
-                now = time.localtime()
-                try:
-                    ts = time.mktime((
-                        now.tm_year, now.tm_mon, now.tm_mday,
-                        int(m.group(1)), int(m.group(2)), int(m.group(3)), 0, 0, 0,
-                    ))
-                except (ValueError, OverflowError):
-                    continue
-                if ts < cutoff:
-                    continue
-                counts[m.group(4)] += 1
-    except (OSError, FileNotFoundError):
-        pass
-    return counts
+    return tui_core.read_log_calls(path, window_sec)
 
 
 def get_cpu_stats() -> dict:
-    try:
-        out = subprocess.run(['uptime'], capture_output=True, text=True, timeout=2).stdout
-        load = out.split('load average:')[1].strip() if 'load average:' in out else '?'
-    except Exception:
-        load = '?'
-    try:
-        cpu_line = subprocess.run(['top', '-bn1'], capture_output=True, text=True, timeout=2).stdout
-        idle = '?'
-        for line in cpu_line.splitlines():
-            if line.startswith('%Cpu'):
-                m = re.search(r'(\d+\.\d+)\s*id', line)
-                if m:
-                    idle = m.group(1)
-                    break
-    except Exception:
-        idle = '?'
-    return {'load': load, 'idle_pct': idle}
+    return tui_core.get_cpu_stats()
 
 
 def get_gpu_stats() -> list[dict]:
-    out = []
-    try:
-        result = subprocess.run(
-            ['nvidia-smi',
-             '--query-gpu=index,name,memory.used,memory.total,utilization.gpu',
-             '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=2,
-        )
-        for line in result.stdout.splitlines():
-            parts = [p.strip() for p in line.split(', ')]
-            if len(parts) >= 5:
-                out.append({
-                    'index': parts[0],
-                    'name': parts[1][:24],
-                    'mem_used_mib': int(parts[2].replace('MiB', '').strip()),
-                    'mem_total_mib': int(parts[3].replace('MiB', '').strip()),
-                    'util_pct': int(parts[4].replace('%', '').strip()),
-                })
-    except Exception:
-        pass
-    return out
+    return tui_core.get_gpu_stats()
 
 
 def get_ollama_models() -> list[dict]:
-    out = []
-    try:
-        import urllib.request
-        with urllib.request.urlopen(f'{OLLAMA_URL}/api/ps', timeout=2) as r:
-            d = json.loads(r.read())
-        for m in d.get('models', []):
-            out.append({
-                'name': m['name'],
-                'vram_gb': m.get('size_vram', 0) / 1e9,
-            })
-    except Exception:
-        pass
-    return out
+    return tui_core.get_ollama_models(OLLAMA_URL)
 
 
 def check_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return tui_core.check_alive(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -440,47 +228,15 @@ def check_alive(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def _load_model_config(path: str) -> dict:
-    """Carga la config de modelos desde JSON. Si no existe, usa defaults."""
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return _default_model_config()
+    return tui_core.load_model_config(path)
 
 
 def _save_model_config(path: str, config: dict) -> None:
-    """Guarda la config de modelos a JSON."""
-    try:
-        with open(path, 'w') as f:
-            json.dump(config, f, indent=2)
-    except OSError:
-        pass
+    tui_core.save_model_config(path, config)
 
 
 def _default_model_config() -> dict:
-    """Config por defecto: todos los modelos habilitados."""
-    try:
-        # Importamos tiers.py si está disponible.
-        import tiers
-        return {
-            'tier0_local': [s.id for s in tiers.TIER0_HUNTERS],
-            'tier0_cloud': [s.id for s in tiers.TIER0_CLOUD_HUNTERS],
-            'tier1_filters': [s.id for s in tiers.TIER1_FILTERS],
-            'tier2_judges': [s.id for s in tiers.TIER2_JUDGES],
-            'tier3_fixers': [s.id for s in tiers.TIER3_FIXERS],
-            'tier4_arbiters': [s.id for s in tiers.TIER4_ARBITERS],
-        }
-    except ImportError:
-        return {
-            'tier0_local': [],
-            'tier0_cloud': [],
-            'tier1_filters': [],
-            'tier2_judges': [],
-            'tier3_fixers': [],
-            'tier4_arbiters': [],
-        }
+    return tui_core.default_model_config()
 
 
 def _show_model_config(stdscr, config: dict) -> dict:
@@ -582,10 +338,10 @@ def draw_header(stdscr, status: dict, harness_alive: bool, y: int = 0) -> int:
     h, w = stdscr.getmaxyx()
     sv = _safe_int(status.get('schema_version', 1), 1)
     if harness_alive:
-        title = f"HARNESS v6 — ACTIVO (PID {status.get('pid', '?')}) [schema v{sv}]"
+        title = f"HARNESS v7 — ACTIVO (PID {status.get('pid', '?')}) [schema v{sv}]"
         title_color = curses.color_pair(COLOR_PAIR_GREEN) | curses.A_BOLD
     else:
-        title = f"HARNESS v6 — MUERTO (PID {status.get('pid', '?')}) [schema v{sv}]"
+        title = f"HARNESS v7 — MUERTO (PID {status.get('pid', '?')}) [schema v{sv}]"
         title_color = curses.color_pair(COLOR_PAIR_RED) | curses.A_BOLD
 
     stdscr.addstr(y, 1, '═' * (w - 2), curses.color_pair(COLOR_PAIR_HEADER))
@@ -795,12 +551,7 @@ def draw_tabs_header(stdscr, current_tab: str, y: int = 0) -> int:
 
 
 def _short_model(mid: str) -> str:
-    """Acorta un model id para que quepa en una caja: 'opencode-go:qwen3.7-max' → 'qwen3.7-max'."""
-    if ':' in mid:
-        return mid.split(':', 1)[1]
-    if '/' in mid:
-        return mid.split('/', 1)[-1]
-    return mid
+    return tui_core.short_model(mid)
 
 
 def draw_process_containers(stdscr, status: dict, y: int) -> int:
@@ -928,7 +679,7 @@ def draw_nodes_panel(stdscr, status: dict, y: int) -> int:
         alive = node.get('alive', False)
         bullet = '*' if alive else 'o'
         bullet_color = curses.color_pair(COLOR_PAIR_GREEN) if alive else curses.color_pair(COLOR_PAIR_RED)
-        host = node.get('host', node.get('id', '?'))[:30]
+        host = tui_core.node_host_label(node)[:30]
         latency = node.get('latency_ms', 0)
         node_line = f' {host}  {latency}ms'
         try:
@@ -1278,7 +1029,7 @@ def main(stdscr):
             log.scroll_down(3)
         elif key in (ord('?'),):
             stdscr.clear()
-            stdscr.addstr(0, 1, "TUI v6 — Teclas", curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
+            stdscr.addstr(0, 1, "TUI v7 — Teclas", curses.color_pair(COLOR_PAIR_HEADER) | curses.A_BOLD)
             help_lines = [
                 "  q / Q     salir",
                 "  r / R     forzar refresh inmediato",

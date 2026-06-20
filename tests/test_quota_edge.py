@@ -143,6 +143,7 @@ class TestRemainingPctEdge(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_ollama_returns_100(self):
         """Ollama → 100% (no consume quota cloud)."""
@@ -185,6 +186,7 @@ class TestFilterTierEdge(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     @patch('quota._run_ai_usage')
     def test_empty_tuple_returns_empty_list(self, mock_run):
@@ -200,6 +202,7 @@ class TestSmartPickEdge(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     @patch('quota._run_ai_usage')
     def test_empty_tuple_returns_none(self, mock_run):
@@ -240,6 +243,7 @@ class TestRecordEdge(unittest.TestCase):
         quota._STATE.by_model_pct.clear()
         quota._STATE.call_log.clear()
         quota._STATE.timestamp = 0.0
+        quota._STATE.last_refresh_started = 0.0
 
     def test_zero_tokens_still_appends(self):
         """Tokens en 0 también se registran (no se filtran)."""

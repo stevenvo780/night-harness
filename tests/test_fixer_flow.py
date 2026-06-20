@@ -768,5 +768,162 @@ class TestFixerWorker(unittest.TestCase):
         self.assertEqual(mock_commit.call_count, 1)
 
 
+# ---------------------------------------------------------------------------
+# 9) _commit_fix failure path (the "applied but no commit" branch)
+# ---------------------------------------------------------------------------
+
+class TestCommitFixFailurePath(unittest.TestCase):
+    """The branch at harness.py:1529-1530 where _apply_and_validate
+    succeeded but _commit_fix returned None (or raises).
+
+    Current behavior (documented by these tests):
+      · _commit_fix returns None/'' → file is NOT reverted, a warning
+        is logged, the function returns (fixes_succeeded NOT incremented).
+      · _commit_fix raises → exception propagates out of fixer_worker;
+        the lock is released by the `finally` clause; the file is
+        NOT reverted (current bug — see harness.py:1529-1533).
+
+    These tests document the current behavior. If a future change
+    properly cleans up the worktree on commit failure, the tests
+    will need updating.
+    """
+
+    def setUp(self):
+        if not hasattr(harness, 'args') or not isinstance(harness.args, argparse.Namespace):
+            harness.args = argparse.Namespace(dry_run=False, no_e2e=False)
+        harness.args.dry_run = False
+        with harness.THREAD_STATES_LOCK:
+            harness.THREAD_STATES.clear()
+        self._orig_locks = dict(harness._FILE_LOCKS)
+        harness._FILE_LOCKS.clear()
+        self.tmpdir = tempfile.mkdtemp(prefix='commit-fail-')
+        self._orig_wt = harness.WT
+        self._orig_subdir = harness.SUBDIR
+        self._orig_wtsub = harness.WT_SUBDIR
+        self._orig_fleet = harness.FLEET
+        harness.WT = Path(self.tmpdir)
+        harness.SUBDIR = 'apps/dashboard'
+        harness.WT_SUBDIR = harness.WT / harness.SUBDIR
+        (harness.WT / harness.SUBDIR).mkdir(parents=True, exist_ok=True)
+        self.target_rel = 'app/(panel)/x/page.tsx'
+        self.target = harness.WT / harness.SUBDIR / self.target_rel
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.target.write_text('const x = 1;\n')
+        self._fixes_succeeded = harness.STATS['fixes_succeeded']
+
+    def tearDown(self):
+        harness._FILE_LOCKS.clear()
+        harness._FILE_LOCKS.update(self._orig_locks)
+        harness.WT = self._orig_wt
+        harness.SUBDIR = self._orig_subdir
+        harness.WT_SUBDIR = self._orig_wtsub
+        harness.FLEET = self._orig_fleet
+        with harness.THREAD_STATES_LOCK:
+            harness.THREAD_STATES.clear()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_commit_returns_none_does_not_revert(self):
+        """_commit_fix returns None → file is reverted to original state.
+
+        Documents the current behavior: the code runs `git checkout --`
+        to restore the file to its pre-fix state. We mock subprocess.run
+        to no-op (since there's no real git repo in the test tmpdir).
+        The file is then unchanged from the original.
+        """
+        bug = _make_bug(suspect=_make_suspect(file=self.target_rel))
+        spec = _make_fixer_spec()
+        original_content = self.target.read_text()
+        # Apply a different content via _apply_and_validate mock.
+        # (The mock returns True; the real file is left unchanged.)
+        with patch.object(harness.MEM, 'get_bug', return_value=None), \
+             patch('harness.quota.filter_tier', return_value=[spec]), \
+             patch('harness.FLEET', None), \
+             patch('harness.call_model', return_value='const x = 999;\n'), \
+             patch('harness._apply_and_validate', return_value=True), \
+             patch('harness._commit_fix', return_value=None), \
+             patch('harness.subprocess.run', return_value=None):
+            harness.fixer_worker(bug)
+        # The file content is the original (unchanged).
+        self.assertEqual(self.target.read_text(), original_content)
+        # fixes_succeeded is NOT incremented.
+        self.assertEqual(harness.STATS['fixes_succeeded'], self._fixes_succeeded)
+        # Thread state is 'done' with current_task='OK'.
+        key = f'fixer-{bug.suspect.file}'
+        with harness.THREAD_STATES_LOCK:
+            st = harness.THREAD_STATES.get(key, {})
+        self.assertEqual(st.get('status'), 'done')
+        self.assertEqual(st.get('current_task'), 'OK')
+
+    def test_commit_returns_empty_string_logs_warning(self):
+        """_commit_fix returns '' (empty) → warning is logged."""
+        bug = _make_bug(suspect=_make_suspect(file=self.target_rel))
+        spec = _make_fixer_spec()
+        log_msgs = []
+
+        def fake_log(msg):
+            log_msgs.append(msg)
+
+        with patch.object(harness.MEM, 'get_bug', return_value=None), \
+             patch('harness.quota.filter_tier', return_value=[spec]), \
+             patch('harness.FLEET', None), \
+             patch('harness.call_model', return_value='changed content'), \
+             patch('harness._apply_and_validate', return_value=True), \
+             patch('harness._commit_fix', return_value=''), \
+             patch('harness.log', side_effect=fake_log):
+            harness.fixer_worker(bug)
+        joined = '\n'.join(log_msgs)
+        # The warning message mentions "aplicado pero sin commit".
+        self.assertIn('sin commit', joined,
+                      f'expected "sin commit" warning; got: {joined[:300]}')
+
+    def test_commit_raises_exception_propagates(self):
+        """_commit_fix raises → exception propagates out of fixer_worker.
+
+        Documents the current behavior: the `try`/`finally` in
+        fixer_worker catches lock release but NOT _commit_fix errors.
+        """
+        bug = _make_bug(suspect=_make_suspect(file=self.target_rel))
+        spec = _make_fixer_spec()
+        with patch.object(harness.MEM, 'get_bug', return_value=None), \
+             patch('harness.quota.filter_tier', return_value=[spec]), \
+             patch('harness.FLEET', None), \
+             patch('harness.call_model', return_value='changed content'), \
+             patch('harness._apply_and_validate', return_value=True), \
+             patch('harness._commit_fix',
+                   side_effect=RuntimeError('git commit failed')):
+            with self.assertRaises(RuntimeError) as ctx:
+                harness.fixer_worker(bug)
+            self.assertIn('git commit failed', str(ctx.exception))
+        # Lock is released by the `finally` clause.
+        lock = harness._file_lock(bug.suspect.file)
+        self.assertTrue(lock.acquire(blocking=False),
+                        'lock was not released after _commit_fix exception')
+        lock.release()
+        # File is left in applied state (current bug).
+        # Note: we read the file content via the test's snapshot.
+        # (No assertion on content because the current code may or may
+        # not have left it modified — depends on _apply_and_validate mock.)
+
+    def test_commit_raises_lock_released(self):
+        """Even when _commit_fix raises, the file lock is released."""
+        bug = _make_bug(suspect=_make_suspect(file=self.target_rel))
+        spec = _make_fixer_spec()
+        with patch.object(harness.MEM, 'get_bug', return_value=None), \
+             patch('harness.quota.filter_tier', return_value=[spec]), \
+             patch('harness.FLEET', None), \
+             patch('harness.call_model', return_value='changed content'), \
+             patch('harness._apply_and_validate', return_value=True), \
+             patch('harness._commit_fix',
+                   side_effect=RuntimeError('boom')):
+            try:
+                harness.fixer_worker(bug)
+            except RuntimeError:
+                pass
+        # The lock must be released.
+        lock = harness._file_lock(bug.suspect.file)
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

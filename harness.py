@@ -41,9 +41,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -53,9 +51,24 @@ import memory
 import orchestrator
 import quota
 import tiers
+from loop_harness import discovery as harness_discovery
+from loop_harness import gates as harness_gates
+from loop_harness import health as harness_health
+from loop_harness import model_calls as harness_calls
+from loop_harness import parser as harness_parser
+from loop_harness import review as harness_review
+from loop_harness import domain as harness_domain
+from loop_harness import status as harness_status
+from loop_harness.domain import Bug, Suspect
 
 STATS_LOCK = threading.Lock()
 _ORCH_LOCK = threading.Lock()
+REVIEW_LOCK = threading.Lock()
+
+# Args del CLI, expuesto a nivel módulo para que worker threads (judge, fixer,
+# e2e producer) puedan leer `args.dry_run` / `args.no_e2e` sin pasarlos por
+# threading.Thread. `main()` muta este mismo namespace vía `parse_args(namespace=...)`.
+args: argparse.Namespace = argparse.Namespace(dry_run=False, no_e2e=False)
 
 # Fleet de hardware (GPUs/nodos + planificación por VRAM). Poblado en main().
 FLEET = None
@@ -91,7 +104,6 @@ STALL_SECS  = int(os.environ.get('LOOP_STALL_SECS', '600'))  # sin avance → li
 LOG_FILE    = Path(os.environ.get('LOOP_LOG', '/tmp/loop-v6.log'))
 STATUS_FILE = Path('/tmp/loop-v6-status.json')
 REVIEW_FILE = Path('/tmp/loop-needs-review.json')
-E2E_FILE    = Path('/tmp/loop-e2e-findings.json')
 
 # Consenso tier 0.
 CONSENSUS_N  = int(os.environ.get('LOOP_CONSENSUS', '3'))     # muestras para auto-consistencia
@@ -107,39 +119,6 @@ RISKY_KEYWORDS = (
     'auth', 'login', 'signin', 'sign-in', 'permiso', 'admin',
     'estado', 'transicion', 'orden',
 )
-
-
-# ---------------------------------------------------------------------------
-# Suspect: una hipótesis de bug (lo que produce el hunter).
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Suspect:
-    """Hipótesis de bug generada por el hunter local. Vive en suspectq."""
-    file: str
-    line: int
-    snippet: str
-    why: str                            # por qué el hunter cree que es bug
-    severity: str = 'medium'            # low | medium | high | critical
-    repro: str = ''                     # cómo dispararlo (opcional)
-    confidence: float = 0.0             # 0..1 (consenso del hunter)
-    samples: int = 0                    # cuántas muestras de auto-consistencia
-    first_seen: float = field(default_factory=time.time)
-    refuted: bool = False               # pasó refutación adversarial?
-    hash: str = ''
-    source: str = 'hunter'              # 'hunter' | 'e2e'
-
-    def __post_init__(self):
-        self.hash = memory.hash_suspect(self.file, self.line, self.snippet)
-
-
-@dataclass
-class Bug:
-    """Bug confirmado por los jueces. Vive en bugq."""
-    suspect: Suspect
-    votes_real: int = 0
-    votes_not_bug: int = 0
-    voters: list[str] = field(default_factory=list)   # modelos que confirmaron
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +149,7 @@ STATS = {
     'fixes_reverted': 0,
     'fixes_to_review': 0,
     'e2e_findings': 0,
+    'e2e_devserver_skips': 0,
     'opus_invocations': 0,
     'started_at': time.time(),
 }
@@ -180,281 +160,53 @@ _current_e2e_journeys = []
 
 
 # ---------------------------------------------------------------------------
-# Estado por-thread (para la TUI dashboard).
-# Cada thread actualiza su entrada en THREAD_STATES con su actividad actual
-# (modelo, archivo, tiempo, calls). La TUI lee esto y muestra un contenedor
-# por proceso.
+# Estado por-thread y status JSON (fachada compatible; implementación modular).
 # ---------------------------------------------------------------------------
-THREAD_STATES: dict[str, dict] = {}
-THREAD_STATES_LOCK = threading.Lock()
+THREAD_STATES = harness_status.THREAD_STATES
+THREAD_STATES_LOCK = harness_status.THREAD_STATES_LOCK
 
 
 def update_thread_state(name: str, **kwargs) -> None:
-    """Actualiza el estado de un thread de forma thread-safe."""
-    with THREAD_STATES_LOCK:
-        if name not in THREAD_STATES:
-            THREAD_STATES[name] = {
-                'kind': '?', 'role': None, 'location': 'local', 'node': 'local',
-                'model': '?', 'status': 'idle',
-                'current_file': '', 'current_task': '',
-                'started_at': time.time(), 'last_update': time.time(),
-                'calls': 0, 'errors': 0, 'avg_ms': 0,
-            }
-        THREAD_STATES[name].update(kwargs)
-        THREAD_STATES[name]['last_update'] = time.time()
+    harness_status.update_thread_state(name, **kwargs)
 
 
 def get_thread_states() -> list[dict]:
-    """Devuelve copia thread-safe del estado de todos los threads."""
-    with THREAD_STATES_LOCK:
-        out = []
-        for name, s in THREAD_STATES.items():
-            entry = dict(s)
-            entry['name'] = name
-            entry['age_sec'] = int(time.time() - s.get('started_at', time.time()))
-            entry['idle_sec'] = int(time.time() - s.get('last_update', time.time()))
-            out.append(entry)
-        return out
+    return harness_status.get_thread_states()
 
 
 def _build_roles() -> list:
-    """Construye la lista roles[] para el schema v2 a partir de THREAD_STATES."""
-    ROLE_ORDER = ['hunter', 'filter', 'judge', 'fixer', 'cloud']
-    CONFIGURED = {
-        'hunter': HUNTER_HILOS + SECOND_HILOS,
-        'filter': FILTER_HILOS,
-        'judge': JUDGE_HILOS,
-        'fixer': FIXER_HILOS,
-        'cloud': CLOUD_HUNTER_HILOS,
-    }
-    LABELS = {
-        'hunter': 'Hunters local', 'filter': 'Filtros', 'judge': 'Jueces',
-        'fixer': 'Fixers', 'cloud': 'Cloud hunters',
-    }
-    with STATS_LOCK:
-        started_at = STATS['started_at']
-    uptime = max(1, time.time() - started_at)
-    # Aggregate per-role stats from THREAD_STATES
-    role_data: dict[str, dict] = {}
-    q_set = set(quarantined_models())
-    with THREAD_STATES_LOCK:
-        states_snapshot = list(THREAD_STATES.items())
-    for name, s in states_snapshot:
-        # Determine role: prefer new 'role' key, fallback to 'kind'
-        role = s.get('role') or s.get('kind', '?')
-        if role in ('cloud', 'hunter'):
-            role_key = 'cloud' if role == 'cloud' else 'hunter'
-        elif role == 'filter':
-            role_key = 'filter'
-        elif role == 'judge':
-            role_key = 'judge'
-        elif role == 'fixer':
-            role_key = 'fixer'
-        else:
-            role_key = role
-        if role_key not in ROLE_ORDER:
-            continue
-        d = role_data.setdefault(role_key, {
-            'live_n': 0, 'busy_n': 0, 'idle_n': 0, 'done_n': 0,
-            'calls_total': 0, 'timeouts': 0, 'errors': 0,
-            'models': set(),
-        })
-        status = s.get('status', 'idle')
-        if status == 'done':
-            d['done_n'] += 1
-        elif status == 'busy':
-            d['live_n'] += 1
-            d['busy_n'] += 1
-        else:
-            d['live_n'] += 1
-            d['idle_n'] += 1
-        d['calls_total'] += s.get('calls', 0)
-        d['errors'] += s.get('errors', 0)
-        model = s.get('model', '')
-        if model and model != '?':
-            d['models'].add(model)
-    # Count quarantined models per role from HEALTH
-    roles_out = []
-    for role_key in ROLE_ORDER:
-        d = role_data.get(role_key, {
-            'live_n': 0, 'busy_n': 0, 'idle_n': 0, 'done_n': 0,
-            'calls_total': 0, 'timeouts': 0, 'errors': 0,
-            'models': set(),
-        })
-        calls_total = d['calls_total']
-        calls_per_min = round(calls_total / (uptime / 60.0), 2) if uptime > 0 else 0.0
-        roles_out.append({
-            'role': role_key,
-            'label': LABELS.get(role_key, role_key),
-            'configured_n': CONFIGURED.get(role_key, 0),
-            'live_n': d['live_n'],
-            'busy_n': d['busy_n'],
-            'idle_n': d['idle_n'],
-            'done_n': d['done_n'],
-            'quarantined_n': sum(1 for m in d['models'] if m in q_set),
-            'calls_total': calls_total,
-            'calls_per_min': calls_per_min,
-            'timeouts': d['timeouts'],
-            'errors': d['errors'],
-            'models': sorted(d['models']),
-        })
-    return roles_out
+    return harness_status.build_roles(
+        stats=STATS,
+        stats_lock=STATS_LOCK,
+        quarantined_models=quarantined_models,
+        hunter_hilos=HUNTER_HILOS,
+        second_hilos=SECOND_HILOS,
+        cloud_hunter_hilos=CLOUD_HUNTER_HILOS,
+        filter_hilos=FILTER_HILOS,
+        judge_hilos=JUDGE_HILOS,
+        fixer_hilos=FIXER_HILOS,
+    )
 
 
 def _build_nodes() -> list:
-    """Construye la lista nodes[] para el schema v2.
-
-    Primero intenta leer /tmp/harness-fleet.json (escrito por fleet.py en Fase C);
-    si no existe, produce un esqueleto local con /api/ps.
-    """
-    fleet_path = Path('/tmp/harness-fleet.json')
-    if fleet_path.exists():
-        try:
-            raw = json.loads(fleet_path.read_text())
-            nodes_out = []
-            for n in raw.get('nodes', []):
-                gpus_out = []
-                for g in n.get('gpus', []):
-                    gpus_out.append({
-                        'index': g.get('index', 0),
-                        'name': g.get('name', '?'),
-                        'vram_used_mib': g.get('vram_total_mib', 0) - g.get('vram_free_mib', 0),
-                        'vram_total_mib': g.get('vram_total_mib', 0),
-                        'util_pct': g.get('util_pct', 0),
-                        'loaded_models': [g['assigned_model']] if g.get('assigned_model') else [],
-                    })
-                ollama_models = []
-                for model_name, vram_mib in n.get('running', {}).items():
-                    ollama_models.append({
-                        'name': model_name,
-                        'vram_gb': round(vram_mib / 1024, 2),
-                        'gpu_index': None,
-                    })
-                nodes_out.append({
-                    'id': n.get('name', 'local'),
-                    'host': n.get('base_url', '').replace('http://', '').replace('https://', ''),
-                    'alive': n.get('online', False),
-                    'latency_ms': 0,
-                    'gpus': gpus_out,
-                    'ollama_models': ollama_models,
-                })
-            return nodes_out
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-    # Fallback: local skeleton via /api/ps
-    base = os.environ.get('LOOP_OLLAMA_BASE', 'http://host.docker.internal:11434')
-    ollama_models = []
-    latency_ms = 0
-    alive = False
-    try:
-        t0 = time.time()
-        with urllib.request.urlopen(f'{base}/api/ps', timeout=3) as r:
-            latency_ms = int((time.time() - t0) * 1000)
-            alive = True
-            data = json.loads(r.read().decode('utf-8'))
-        for m in data.get('models', []) or []:
-            name = (m.get('name') or '').strip()
-            size_vram = int(m.get('size_vram', 0) or 0)
-            if name:
-                ollama_models.append({
-                    'name': name,
-                    'vram_gb': round(size_vram / 1e9, 2),
-                    'gpu_index': None,
-                })
-    except Exception:
-        pass
-    return [{
-        'id': 'local',
-        'host': base.replace('http://', '').replace('https://', ''),
-        'alive': alive,
-        'latency_ms': latency_ms,
-        'gpus': [],
-        'ollama_models': ollama_models,
-    }]
+    return harness_status.build_nodes()
 
 
 def write_status() -> None:
-    """Volca el estado para /tmp/loop-v6-status.json (TUI / debug). Schema v2."""
-    threads_raw = get_thread_states()
-    threads_v2 = []
-    for s in threads_raw:
-        threads_v2.append({
-            'name': s.get('name', '?'),
-            'role': s.get('role') or s.get('kind', '?'),
-            'location': s.get('location', 'local'),
-            'node': s.get('node', 'local'),
-            'model': s.get('model', '?'),
-            'status': s.get('status', 'idle'),
-            'current_file': s.get('current_file', ''),
-            'current_task': s.get('current_task', ''),
-            'calls': s.get('calls', 0),
-            'errors': s.get('errors', 0),
-            'avg_ms': s.get('avg_ms', 0),
-            'age_sec': s.get('age_sec', 0),
-            'idle_sec': s.get('idle_sec', 0),
-        })
-    with STATS_LOCK:
-        stats_snapshot = dict(STATS)
-    with _ORCH_LOCK:
-        orch_prompts = list(_current_orch_prompts)
-        e2e_journeys = list(_current_e2e_journeys)
-    payload = {
-        'schema_version': 2,
-        'ts': time.time(),
-        'pid': os.getpid(),
-        'uptime_sec': int(time.time() - stats_snapshot['started_at']),
-        'funnel': {
-            'suspects_produced': stats_snapshot.get('suspects_produced', 0),
-            'suspects_refuted': stats_snapshot.get('suspects_refuted_by_filter', 0),
-            'suspects_known_fp': stats_snapshot.get('suspects_filtered_as_known_fp', 0),
-            'bugs_confirmed': stats_snapshot.get('bugs_confirmed', 0),
-            'fixes_attempted': stats_snapshot.get('fixes_attempted', 0),
-            'fixes_succeeded': stats_snapshot.get('fixes_succeeded', 0),
-            'fixes_reverted': stats_snapshot.get('fixes_reverted', 0),
-            'fixes_to_review': stats_snapshot.get('fixes_to_review', 0),
-            'e2e_findings': stats_snapshot.get('e2e_findings', 0),
-            'opus_invocations': stats_snapshot.get('opus_invocations', 0),
-            'rounds': stats_snapshot.get('rounds', 0),
-            'clean_rounds_in_a_row': stats_snapshot.get('clean_rounds_in_a_row', 0),
-        },
-        'roles': _build_roles(),
-        'threads': threads_v2,
-        'orchestrator': {
-            'model': orchestrator.ORCHESTRATOR_MODEL,
-            # FIX crash TUI: int directo con sufijo _n (NO hacer len() sobre esto)
-            'hunting_prompts_n': len(orch_prompts),
-            'e2e_journeys_n': len(e2e_journeys),
-            'ready': bool(orch_prompts),
-        },
-        'nodes': _build_nodes(),
-        'quota': quota.local_spend(),
-        'memory': {
-            'total_rounds': MEM.total_rounds,
-            'total_bugs_found': MEM.total_bugs_found,
-            'total_fixes_applied': MEM.total_fixes_applied,
-            'open_bugs': len(MEM.open_bugs()),
-            'hardened_zones': sum(1 for z in MEM.zones.values() if z.clean_rounds >= 3),
-        },
-        # Backward compat: keep 'stats' so existing stats tab in TUI still works
-        'stats': {
-            'rounds': stats_snapshot.get('rounds', 0),
-            'clean_rounds_in_a_row': stats_snapshot.get('clean_rounds_in_a_row', 0),
-            'suspects_produced': stats_snapshot.get('suspects_produced', 0),
-            'suspects_refuted_by_filter': stats_snapshot.get('suspects_refuted_by_filter', 0),
-            'suspects_filtered_as_known_fp': stats_snapshot.get('suspects_filtered_as_known_fp', 0),
-            'bugs_confirmed': stats_snapshot.get('bugs_confirmed', 0),
-            'fixes_attempted': stats_snapshot.get('fixes_attempted', 0),
-            'fixes_succeeded': stats_snapshot.get('fixes_succeeded', 0),
-            'fixes_reverted': stats_snapshot.get('fixes_reverted', 0),
-            'fixes_to_review': stats_snapshot.get('fixes_to_review', 0),
-            'e2e_findings': stats_snapshot.get('e2e_findings', 0),
-            'opus_invocations': stats_snapshot.get('opus_invocations', 0),
-        },
-    }
-    try:
-        STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
-    except OSError:
-        pass
+    payload = harness_status.build_status_payload(
+        pid=os.getpid(),
+        stats=STATS,
+        stats_lock=STATS_LOCK,
+        orch_lock=_ORCH_LOCK,
+        orch_prompts=_current_orch_prompts,
+        e2e_journeys=_current_e2e_journeys,
+        orchestrator_model=orchestrator.ORCHESTRATOR_MODEL,
+        roles=_build_roles(),
+        nodes=_build_nodes(),
+        quota_snapshot=quota.local_spend(),
+        memory_obj=MEM,
+    )
+    harness_status.write_status_file(STATUS_FILE, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -504,383 +256,154 @@ _HEALTH_LOCK = threading.Lock()
 
 
 def _mark_health(model_id: str, ok: bool) -> None:
-    """Registra el resultado de una llamada. Cuarentena tras N fallos seguidos."""
-    with _HEALTH_LOCK:
-        h = _HEALTH.setdefault(model_id, {'fails': 0, 'quarantined_until': 0.0,
-                                          'calls': 0, 'oks': 0})
-        h['calls'] += 1
-        if ok:
-            h['oks'] += 1
-            h['fails'] = 0
-            # Un éxito limpia la racha, pero NO levanta una cuarentena ACTIVA
-            # (evita flapping: fail×3 → cuarentena → 1 probe con suerte → escapa).
-            # La cuarentena expira sola por tiempo.
-            if h['quarantined_until'] <= time.time():
-                h['quarantined_until'] = 0.0
-        else:
-            h['fails'] += 1
-            if h['fails'] >= HEALTH_FAIL_THRESHOLD and h['quarantined_until'] <= time.time():
-                h['quarantined_until'] = time.time() + QUARANTINE_SECS
-                log(f'  [health] {model_id} → CUARENTENA {QUARANTINE_SECS}s '
-                    f'({h["fails"]} fallos seguidos)')
+    harness_health.mark_health(
+        _HEALTH,
+        _HEALTH_LOCK,
+        model_id=model_id,
+        ok=ok,
+        fail_threshold=HEALTH_FAIL_THRESHOLD,
+        quarantine_secs=QUARANTINE_SECS,
+        log=log,
+    )
 
 
 def is_healthy(model_id: str) -> bool:
-    with _HEALTH_LOCK:
-        h = _HEALTH.get(model_id)
-        if not h:
-            return True
-        now = time.time()
-        quarantine_until = h.get('quarantined_until', 0.0)
-        # Quarantine expired: reset counter for recovery
-        if now >= quarantine_until and quarantine_until > 0:
-            h['fails'] = 0
-            h['quarantined_until'] = 0.0
-        return now >= quarantine_until
+    return harness_health.is_healthy(_HEALTH, _HEALTH_LOCK, model_id)
 
 
 def quarantined_models() -> list[str]:
-    now = time.time()
-    with _HEALTH_LOCK:
-        return sorted(m for m, h in _HEALTH.items() if now < h.get('quarantined_until', 0.0))
+    return harness_health.quarantined_models(_HEALTH, _HEALTH_LOCK)
 
 
 def seed_quarantine(ids=INITIAL_QUARANTINE) -> None:
-    """Mete la lista de modelos conocidos-zombi en cuarentena inicial (gratis)."""
-    if not ids:
-        return
-    with _HEALTH_LOCK:
-        for mid in ids:
-            h = _HEALTH.setdefault(mid, {'fails': 0, 'quarantined_until': 0.0,
-                                         'calls': 0, 'oks': 0})
-            h['fails'] = HEALTH_FAIL_THRESHOLD
-            h['quarantined_until'] = time.time() + QUARANTINE_SECS
-    log(f'  [health] cuarentena inicial sembrada: {list(ids)}')
+    harness_health.seed_quarantine(
+        _HEALTH,
+        _HEALTH_LOCK,
+        ids,
+        fail_threshold=HEALTH_FAIL_THRESHOLD,
+        quarantine_secs=QUARANTINE_SECS,
+        log=log,
+    )
 
 
 def health_probe_all(specs, timeout: int = 25, workers: int = 8) -> None:
-    """Probe de arranque OPCIONAL (LOOP_HEALTH_PROBE=1): una llamada corta a cada
-    modelo único. Los que no responden quedan en cuarentena de inmediato. Cuesta
-    un poco de cuota cloud, por eso es opt-in; la marca perezosa en `call_model`
-    cubre el caso por defecto."""
-    seen = {}
-    for s in specs:
-        seen.setdefault(s.id, s)
-
-    def _probe(spec):
-        try:
-            t = call_model(spec, '', 'Responde solo: OK', max_tokens=8, timeout=timeout)
-        except Exception:
-            t = None
-        if t and t.strip():
-            log(f'  [health] probe OK {spec.id}')
-        else:
-            with _HEALTH_LOCK:
-                h = _HEALTH.setdefault(spec.id, {'fails': 0, 'quarantined_until': 0.0,
-                                                 'calls': 0, 'oks': 0})
-                h['fails'] = max(h['fails'], HEALTH_FAIL_THRESHOLD)
-                h['quarantined_until'] = time.time() + QUARANTINE_SECS
-            log(f'  [health] probe FALLÓ {spec.id} → cuarentena')
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_probe, seen.values()))
+    harness_health.health_probe_all(
+        specs,
+        call_model=call_model,
+        health=_HEALTH,
+        lock=_HEALTH_LOCK,
+        fail_threshold=HEALTH_FAIL_THRESHOLD,
+        quarantine_secs=QUARANTINE_SECS,
+        log=log,
+        timeout=timeout,
+        workers=workers,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Invocación de modelos: punto único. Decide QUÉ modelo usar según rol +
-# estado de cuota, y registra el uso en `quota.record`.
+# Invocación de modelos: fachada compatible; implementación en loop_harness.
 # ---------------------------------------------------------------------------
+
+_OLLAMA_SEMAPHORES = harness_calls._OLLAMA_SEMAPHORES
+_OLLAMA_SEM_GUARD = harness_calls._OLLAMA_SEM_GUARD
+
 
 def call_model(spec: tiers.ModelSpec, system: str, prompt: str, max_tokens: int = 2048,
                timeout: int = 120) -> Optional[str]:
-    """Llama al modelo y devuelve el texto. None si falla (cuota, timeout, error).
-
-    Para modelos locales (Ollama) usa HTTP al endpoint.
-    Para modelos cloud usa el CLI correspondiente.
-    """
-    if not quota.is_model_ok(spec.id):
-        log(f'  [quota] {spec.id} bloqueado por cuota')
-        return None
-    if not is_healthy(spec.id):
-        return None  # zombi en cuarentena: no lo invocamos (atasca la cola)
-
-    t0 = time.time()
-    text: Optional[str] = None
-    in_tok = 0
-    out_tok = 0
-
-    try:
-        if spec.id.startswith('ollama:'):
-            text = _call_ollama(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('minimax/') or spec.id.startswith('minimax:'):
-            text = _call_minimax(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('opencode:') or spec.id.startswith('opencode-go:'):
-            text = _call_opencode(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('gemini:'):
-            text = _call_gemini_cli(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('claude:'):
-            text = _call_claude_cli(spec, prompt, system, max_tokens, timeout)
-        elif spec.id.startswith('codex:'):
-            text = _call_codex_cli(spec, prompt, system, max_tokens, timeout)
-        else:
-            log(f'  [call] modelo desconocido: {spec.id}')
-            return None
-
-        # Estimar tokens (los CLIs no devuelven usage por defecto; usamos chars como proxy).
-        if text is not None:
-            in_tok = max(1, (len(system) + len(prompt)) // 4)
-            out_tok = max(1, len(text) // 4)
-    except subprocess.TimeoutExpired:
-        log(f'  [call] {spec.id} timeout {timeout}s')
-    except Exception as e:
-        log(f'  [call] {spec.id} error: {e}')
-
-    # Salud: respuesta NO vacía = vivo; timeout/error/vacío = fallo. Usamos
-    # presencia de texto (no longitud) para no penalizar respuestas válidas y
-    # cortas como "REAL"/"OK" del filtro/juez.
-    _mark_health(spec.id, ok=bool(text and text.strip()))
-    quota.record(spec.id, in_tok, out_tok)
-    elapsed = time.time() - t0
-    log(f'  [call] {spec.id} {elapsed:.1f}s  in~{in_tok}  out~{out_tok}')
-    return text
+    return harness_calls.call_model(
+        spec,
+        system,
+        prompt,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        quota_module=quota,
+        is_healthy=is_healthy,
+        mark_health=_mark_health,
+        log=log,
+        call_ollama=_call_ollama,
+        call_minimax=_call_minimax,
+        call_opencode=_call_opencode,
+        call_gemini_cli=_call_gemini_cli,
+        call_claude_cli=_call_claude_cli,
+        call_codex_cli=_call_codex_cli,
+    )
 
 
 def _cli_cwd() -> Optional[str]:
-    """cwd para los CLI cloud agénticos (opencode/claude/gemini/codex).
-
-    Estos CLIs tienen herramientas de lectura de archivos que resuelven paths
-    RELATIVOS a su cwd. Si corren desde el dir del harness, un prompt que menciona
-    `app/(panel)/clientes/page.tsx` provoca `File not found` (el archivo vive en el
-    worktree). Devolvemos el worktree real si existe; si no, None (hereda el del
-    harness, comportamiento previo).
-    """
-    return str(WT_SUBDIR) if WT_SUBDIR.is_dir() else None
-
-
-# Semáforos por modelo Ollama: limitan la concurrencia contra una misma GPU para
-# evitar contención (el 30B daba `timed out` con 4 hilos pegándole a la vez). CPU=1
-# (80B serializado), GPU=2 (configurable con LOOP_OLLAMA_GPU_CONC).
-_OLLAMA_SEMAPHORES: dict[str, threading.Semaphore] = {}
-_OLLAMA_SEM_GUARD = threading.Lock()
+    return harness_calls.cli_cwd(WT_SUBDIR)
 
 
 def _is_cpu_model(model_name: str) -> bool:
-    n = model_name.lower()
-    return 'cpu' in n or '80b' in n or 'next' in n
+    return harness_calls.is_cpu_model(model_name)
 
 
 def _ollama_sem(model_name: str) -> threading.Semaphore:
-    with _OLLAMA_SEM_GUARD:
-        sem = _OLLAMA_SEMAPHORES.get(model_name)
-        if sem is None:
-            limit = 1 if _is_cpu_model(model_name) else int(
-                os.environ.get('LOOP_OLLAMA_GPU_CONC', '2'))
-            sem = threading.Semaphore(limit)
-            _OLLAMA_SEMAPHORES[model_name] = sem
-        return sem
+    return harness_calls.ollama_sem(model_name)
 
 
 def _call_ollama(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                  timeout: int) -> str:
-    model_name = spec.id.split(':', 1)[1]
-    # Node-aware (Fase B/C): si el spec trae base_url/num_ctx/gpu_index (poblados
-    # por el fleet), se usan; si no, defaults de entorno (comportamiento actual).
-    base = getattr(spec, 'base_url', None) or (
-        os.environ.get('LOOP_OLLAMA_BASE') or 'http://host.docker.internal:11434')
-    num_ctx = getattr(spec, 'num_ctx', None) or int(
-        os.environ.get('LOOP_OLLAMA_NUM_CTX', '8192'))
-    options = {'num_predict': max_tokens, 'temperature': 0.2, 'num_ctx': num_ctx}
-    gpu_index = getattr(spec, 'gpu_index', None)
-    if gpu_index is not None:
-        # Hint best-effort; el pin fiable por GPU = instancia Ollama por GPU (Fase C).
-        options['main_gpu'] = gpu_index
-    payload = {
-        'model': model_name,
-        'prompt': prompt,
-        'system': system,
-        'stream': False,
-        # `keep_alive: '10m'` evita que Ollama descargue el modelo entre requests.
-        'keep_alive': os.environ.get('LOOP_OLLAMA_KEEP_ALIVE', '10m'),
-        'options': options,
-    }
-    # CPU (80B) ~10-20x más lento que GPU → piso de 300s.
-    actual_timeout = max(timeout, 300) if _is_cpu_model(model_name) else timeout
-    req = urllib.request.Request(
-        f'{base}/api/generate',
-        data=json.dumps(payload).encode(),
-        headers={'Content-Type': 'application/json'},
+    return harness_calls.call_ollama(spec, prompt, system, max_tokens, timeout)
+
+
+def _clean_cli_out(stdout: str) -> str:
+    return harness_calls.clean_cli_out(stdout)
+
+
+def _call_cli(cmd: list[str], prompt: str, system: str, timeout: int,
+              *, name: str = 'cli',
+              min_timeout: int = 0,
+              on_stderr=None) -> str:
+    return harness_calls.call_cli(
+        cmd,
+        prompt,
+        system,
+        timeout,
+        cwd=_cli_cwd,
+        log=log,
+        name=name,
+        min_timeout=min_timeout,
+        on_stderr=on_stderr,
     )
-    # Semáforo por modelo: evita que N hilos saturen la misma GPU (causa de timeouts).
-    with _ollama_sem(model_name):
-        with urllib.request.urlopen(req, timeout=actual_timeout) as r:
-            data = json.loads(r.read())
-    return data.get('response', '').strip()
 
 
 def _call_minimax(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
-                 timeout: int) -> str:
-    """Invoca Minimax vía el CLI opencode. Formato del id: 'minimax/MiniMax-M3'
-    (provider/model con slash). Si opencode no está en PATH, intenta HTTP
-    directo al API.
-    """
-    # El spec.id es 'minimax/MiniMax-M3' (formato opencode). Lo pasamos tal cual.
-    model_id = spec.id  # 'minimax/MiniMax-M3'
-    full_prompt = (f'<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}' if system else prompt)
-    try:
-        result = subprocess.run(
-            ['opencode', 'run', '--model', model_id, full_prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
-        )
-        out = result.stdout.strip()
-        if not out and result.stderr:
-            # opencode suele loguear el error a stderr; mostrarlo.
-            log(f'  [minimax] stderr: {result.stderr[:200]}')
-        return out
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f'  [minimax] CLI falló: {e}; probando HTTP directo')
-        # Fallback: HTTP al API de Minimax (si hay MINIMAX_API_KEY en env).
-        model_name = spec.id.split('/', 1)[-1]  # 'MiniMax-M3'
-        return _call_minimax_http(model_name, full_prompt, max_tokens, timeout)
+                  timeout: int) -> str:
+    return harness_calls.call_minimax(
+        spec, prompt, system, max_tokens, timeout, cwd=_cli_cwd, log=log
+    )
 
 
 def _call_minimax_http(model: str, prompt: str, max_tokens: int, timeout: int) -> str:
-    api_key = os.environ.get('MINIMAX_API_KEY', '')
-    if not api_key:
-        return ''
-    base = os.environ.get('MINIMAX_API_BASE', 'https://api.minimax.io/v1')
-    req = urllib.request.Request(
-        f'{base}/chat/completions',
-        data=json.dumps({
-            'model': model,
-            'messages': [{'role': 'user', 'content': prompt}],
-            'max_tokens': max_tokens,
-        }).encode(),
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read())
-    return data['choices'][0]['message']['content'].strip()
+    return harness_calls.call_minimax_http(model, prompt, max_tokens, timeout)
 
 
 def _call_opencode(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                    timeout: int) -> str:
-    """Invoca un modelo opencode u opencode-go vía el CLI `opencode run`.
-
-    Formato del id: 'opencode:deepseek-v4-flash-free' o 'opencode-go:glm-5.2'.
-    OpenCode espera el formato `provider/model` con SLASH (no dos puntos),
-    así que convertimos `opencode-go:glm-5.2` → `opencode-go/glm-5.2` al
-    invocar. La key opencode-go la lee opencode de `API_KEY` env var.
-
-    Probado en jul-2026: los 5 free + los 8 pro responden en 4-25s.
-    """
-    # Convertir formato `provider:model` a `provider/model` que opencode espera.
-    opencode_model_id = spec.id.replace(':', '/', 1)
-    full_prompt = (f'<<SYS>>\n{system}\n<</SYS>>\n\n{prompt}' if system else prompt)
-    try:
-        # OpenCode tarda en arrancar (~3s) + latencia del modelo (4-25s).
-        # Timeout por defecto 60s; estirar a 180s para prompts grandes.
-        actual_timeout = max(timeout, 180)
-        result = subprocess.run(
-            ['opencode', 'run', '--model', opencode_model_id, full_prompt],
-            capture_output=True,
-            text=True,
-            timeout=actual_timeout,
-            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
-        )
-        out = result.stdout.strip()
-        if not out and result.stderr:
-            # opencode loguea el error a stderr; mostrarlo.
-            log(f'  [opencode] {opencode_model_id} stderr: {result.stderr[:200]}')
-        # Filtrar las líneas de "build" que opencode-go antepone.
-        out = '\n'.join(
-            line for line in out.split('\n')
-            if not line.startswith('[0m') and 'build ·' not in line
-        ).strip()
-        return out
-    except FileNotFoundError:
-        log(f'  [opencode] CLI `opencode` no encontrado en PATH')
-        return ''
-    except subprocess.TimeoutExpired:
-        log(f'  [opencode] {opencode_model_id} timeout {actual_timeout}s')
-        return ''
+    return harness_calls.call_opencode(
+        spec, prompt, system, max_tokens, timeout, cwd=_cli_cwd, log=log
+    )
 
 
 def _call_claude_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
-                    timeout: int) -> str:
-    model = spec.id.split(':', 1)[1]
-    full_prompt = prompt
-    if system:
-        full_prompt = f'<system>{system}</system>\n\n{prompt}'
-    try:
-        result = subprocess.run(
-            ['claude', '-p', full_prompt, '--model', model, '--output-format', 'text'],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
-        )
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f'  [claude] CLI falló: {e}')
-        return ''
+                     timeout: int) -> str:
+    return harness_calls.call_claude_cli(
+        spec, prompt, system, max_tokens, timeout, cwd=_cli_cwd, log=log
+    )
 
 
 def _call_gemini_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                      timeout: int) -> str:
-    """Invoca Gemini CLI en modo headless. Flags verificados:
-    - `-m <model>`: modelo concreto (alias como 'flash' también funciona).
-    - `-p <prompt>`: modo headless.
-    - `--yolo`: auto-aprueba tools (necesario porque el CLI pregunta).
-    - `--output-format text`: salida limpia, sin JSON-RPC.
-    """
-    model = spec.id.split(':', 1)[1]
-    full_prompt = f'{system}\n\n{prompt}' if system else prompt
-    try:
-        result = subprocess.run(
-            ['gemini', '-m', model, '-p', full_prompt,
-             '--yolo', '--output-format', 'text'],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
-        )
-        if result.returncode != 0 and '429' in (result.stderr or ''):
-            # Rate limit conocido: marcar para cuarentena.
-            log(f'  [gemini] {model} rate-limited (429)')
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f'  [gemini] CLI falló: {e}')
-        return ''
+    return harness_calls.call_gemini_cli(
+        spec, prompt, system, max_tokens, timeout, cwd=_cli_cwd, log=log
+    )
 
 
 def _call_codex_cli(spec: tiers.ModelSpec, prompt: str, system: str, max_tokens: int,
                     timeout: int) -> str:
-    """Invoca Codex CLI. Flags verificados:
-    - `codex exec <prompt>`: subcomando `exec` para no-interactive.
-    - `--model <model>`: modelo concreto (gpt-5.5 es el default; codex-mini NO soportado).
-    - `--skip-git-repo-check`: si el worktree tiene su propio git.
-    """
-    # Si el spec es `codex:gpt-5.5`, extraemos 'gpt-5.5'. Si no, default 'gpt-5.5'.
-    model = spec.id.split(':', 1)[1] if ':' in spec.id else 'gpt-5.5'
-    full_prompt = f'{system}\n\n{prompt}' if system else prompt
-    try:
-        result = subprocess.run(
-            ['codex', 'exec', '--model', model, '--skip-git-repo-check', full_prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=_cli_cwd(),       # AGÉNTICO: lee archivos del worktree real
-        )
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f'  [codex] CLI falló: {e}')
-        return ''
+    return harness_calls.call_codex_cli(
+        spec, prompt, system, max_tokens, timeout, cwd=_cli_cwd, log=log
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -922,61 +445,7 @@ Una línea JSON por bug. Si NO encuentras bugs en la zona, responde EXACTAMENTE:
 
 
 def _parse_bug_line(line: str) -> Optional[dict]:
-    """Extrae {file, line, severity, snippet, why, repro} de una línea del hunter.
-
-    Contrato nuevo (v7): una línea JSON por bug. Fallback robusto al formato viejo
-    `path:line <sep> texto`, des-duplicando el caso histórico en que snippet y why
-    quedaban idénticos (con `::` literales). Garantiza snippet (código) ≠ why (prosa)
-    cuando hay información para separarlos.
-    """
-    line = line.strip()
-    if not line or line.startswith('#') or line.startswith('NO_BUGS'):
-        return None
-
-    # --- Contrato nuevo: JSON por bug ---
-    if line.startswith('{') and line.endswith('}'):
-        try:
-            d = json.loads(line)
-            f = str(d.get('file', '')).strip()
-            if f and ('line' in d):
-                return {
-                    'file': f,
-                    'line': int(d.get('line', 0) or 0),
-                    'severity': str(d.get('severity', 'medium')).lower(),
-                    'snippet': str(d.get('snippet', ''))[:200],
-                    'why': str(d.get('why', ''))[:500],
-                    'repro': str(d.get('repro', ''))[:300],
-                }
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass  # cae al fallback de línea
-
-    # --- Fallback: `path/file.ext:LINE <sep> resto` (formatos viejos 1-4) ---
-    PATH = r'[\w/.\-()]+\.[a-z]{1,5}'
-    m = re.match(
-        rf'^[\s\-\*`]*(?P<file>{PATH}):(?P<line>\d+)`?'
-        r'\s*[:\-–—]*\s*(?P<rest>.{5,800})$',
-        line,
-    )
-    if not m:
-        return None
-    rest = m.group('rest').strip().strip('`')
-    if '::' in rest:
-        # Formato histórico FILE::LINE::SNIPPET::REASON re-serializado: des-duplica.
-        parts = [p.strip() for p in rest.split('::') if p.strip()]
-        snippet = parts[0][:200] if parts else ''
-        why = (parts[-1] if len(parts) > 1 else parts[0])[:500] if parts else ''
-    else:
-        # Sin separador código/prosa: usamos el texto como why; snippet queda vacío
-        # (mejor vacío que duplicar la prosa como si fuera código).
-        snippet, why = '', rest[:500]
-    return {
-        'file': m.group('file'),
-        'line': int(m.group('line')),
-        'severity': 'medium',
-        'snippet': snippet,
-        'why': why,
-        'repro': '',
-    }
+    return harness_parser.parse_bug_line(line)
 
 
 def hunter_worker(zone_files: list[str], hunter_spec: tiers.ModelSpec, wid: int,
@@ -1132,7 +601,9 @@ def yield_suspect(s: Suspect) -> None:
     # llegaban hasta el fixer y gastaban jueces antes de abortar. Los hallazgos
     # E2E se mapean a archivo real antes de entrar aquí.
     s.file = (s.file or '').strip().lstrip('`').lstrip('./')
-    if not s.file or not (WT_SUBDIR / s.file).is_file():
+    # Contención: la salida del modelo no debe escapar el worktree (path traversal).
+    safe = harness_domain.safe_subpath(WT_SUBDIR, s.file)
+    if safe is None or not safe.is_file():
         log(f'  [yield] descartado fantasma {s.file!r}:{s.line}')
         return
 
@@ -1145,18 +616,10 @@ def yield_suspect(s: Suspect) -> None:
 
     with STATS_LOCK:
         STATS['suspects_produced'] += 1
-    if s.source == 'cloud':
-        # Cloud hunter: a jueces directo (más preciso).
-        try:
-            bugq.put_nowait(Bug(suspect=s))
-            log(f'  [yield] cloud→juez {s.file}:{s.line}')
-        except queue.Full:
-            suspectq.put_nowait(s)  # fallback a filtro si bugq llena
-    else:
-        try:
-            suspectq.put_nowait(s)
-        except queue.Full:
-            pass
+    try:
+        suspectq.put_nowait(s)
+    except queue.Full:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1527,7 +990,20 @@ def fixer_worker(bug: Bug) -> None:
                         f'({spec.id} → {commit[:7]})')
                 else:
                     # Aplicado pero no comiteado (validó pero git falló).
-                    log(f'  [fixer] aplicado pero sin commit: {path}')
+                    # Limpiar working tree + index antes de propagar el error;
+                    # si no, el próximo fixer leerá la versión parchada como
+                    # `original` y aplicará un fix encima del fix anterior.
+                    rel = path.relative_to(WT)
+                    if _looks_like_patch(cleaned):
+                        _revert_patch(cleaned)
+                    try:
+                        subprocess.run(
+                            ['git', 'checkout', '--', str(rel)],
+                            cwd=str(WT), capture_output=True, timeout=10,
+                        )
+                    except Exception as e:
+                        log(f'  [fixer] no se pudo hacer git checkout tras fallo de commit: {e}')
+                    log(f'  [fixer] aplicado pero sin commit: {path} (revertido)')
                 update_thread_state(f'fixer-{bug.suspect.file}', status='done',
                                     current_task='OK')
                 return
@@ -1544,209 +1020,78 @@ def fixer_worker(bug: Bug) -> None:
 
 
 def _looks_like_patch(text: str) -> bool:
-    t = text.lstrip()
-    # Patch real: empieza con cabecera de diff, o contiene cabeceras --- Y +++ Y @@.
-    # (un '@@' suelto en medio de código NO es un patch.)
-    return (t.startswith(('--- ', 'diff ', '@@ '))
-            or ('--- ' in text and '+++ ' in text and '@@' in text))
+    return harness_gates.looks_like_patch(text)
 
 
 def _apply_patch(diff_text: str) -> bool:
-    try:
-        r = subprocess.run(['git', 'apply', '--3way', '--whitespace=nowarn', '-'],
-                           input=diff_text, cwd=str(WT), capture_output=True,
-                           text=True, timeout=30)
-        if r.returncode != 0:
-            log(f'  [fix] git apply falló: {(r.stderr or "")[:160]}')
-        return r.returncode == 0
-    except Exception as e:
-        log(f'  [fix] git apply excepción: {e}')
-        return False
+    return harness_gates.apply_patch(diff_text, wt=WT, log=log)
 
 
 def _revert_patch(diff_text: str) -> bool:
-    """Revierte un patch aplicado con git apply -R."""
-    try:
-        r = subprocess.run(['git', 'apply', '-R', '--3way', '--whitespace=nowarn', '-'],
-                           input=diff_text, cwd=str(WT), capture_output=True,
-                           text=True, timeout=30)
-        if r.returncode != 0:
-            log(f'  [fix] git apply -R falló: {(r.stderr or "")[:160]}')
-        return r.returncode == 0
-    except Exception as e:
-        log(f'  [fix] git apply -R excepción: {e}')
-        return False
+    return harness_gates.revert_patch(diff_text, wt=WT, log=log)
 
 
 def _patch_files(diff_text: str) -> set:
-    """Extrae los archivos tocados por un diff unificado."""
-    files = set()
-    for ln in diff_text.splitlines():
-        if ln.startswith(('+++ ', '--- ')):
-            p = ln[4:].split('\t', 1)[0].strip()
-            if p and p != '/dev/null':
-                files.add(re.sub(r'^[ab]/', '', p))
-    return files
+    return harness_gates.patch_files(diff_text)
 
 
 def _apply_and_validate(path: Path, new_content: str, suspect: Suspect) -> bool:
-    """Aplica el cambio (archivo completo o patch unificado), corre tsc + E2E
-    DIRIGIDO a la ruta del bug; revierte si falla. El caller (fixer_worker)
-    restaura `path` si devolvemos False, así que aquí solo rechazamos patches
-    multi-archivo (no restaurables por el caller)."""
-    if _looks_like_patch(new_content):
-        touched = _patch_files(new_content)
-        if len(touched) > 1:
-            log(f'  [fix] patch multi-archivo rechazado: {sorted(touched)}')
-            return False
-        if not _apply_patch(new_content):
-            return False
-        # Verificar que el patch toca suspect.file
-        expected = {suspect.file}
-        if SUBDIR not in ('', '.'):
-            expected.add(str(Path(SUBDIR) / suspect.file))
-        if not (touched & expected):
-            log(f'  [fix] patch no toca {suspect.file}; patch cubre {sorted(touched)}')
-            _revert_patch(new_content)
-            return False
-    else:
-        try:
-            path.write_text(new_content)
-        except OSError as e:
-            log(f'  [fix] no se pudo escribir: {e}')
-            return False
-    # Gate 1: typecheck (cubre lib/ no-ruteable y errores de tipo).
-    if not _run_tsc():
-        log('  [fix] tsc falló')
-        return False
-    # Gate 2: E2E DIRIGIDO a la ruta afectada (no solo la home).
-    if not _run_smoke_subset(suspect.file):
-        log('  [fix] E2E gate falló')
-        return False
-    return True
+    return harness_gates.apply_and_validate(
+        path,
+        new_content,
+        suspect,
+        subdir=SUBDIR,
+        log=log,
+        looks_like_patch_fn=_looks_like_patch,
+        patch_files_fn=_patch_files,
+        apply_patch_fn=_apply_patch,
+        revert_patch_fn=_revert_patch,
+        run_tsc_fn=_run_tsc,
+        run_smoke_subset_fn=_run_smoke_subset,
+    )
 
 
 def _run_tsc() -> bool:
-    try:
-        result = subprocess.run(
-            ['npx', 'tsc', '--noEmit'],
-            cwd=str(WT / SUBDIR),
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
+    return harness_gates.run_tsc(wt=WT, subdir=SUBDIR)
 
 
 def _route_for_file(file_path: str) -> Optional[str]:
-    """Deriva la ruta URL del módulo afectado a partir del path del archivo."""
-    if not file_path:
-        return None
-    m = re.search(r'app/\(panel\)/([^/]+)/', file_path)
-    if m:
-        return '/' + m.group(1)
-    m = re.search(r'app/([^/(][^/]*)/', file_path)  # rutas fuera de (panel)
-    return '/' + m.group(1) if m else None
+    return harness_gates.route_for_file(file_path)
 
 
 def _dev_server_up() -> bool:
-    try:
-        with urllib.request.urlopen(DEV_URL + '/', timeout=8) as r:
-            return r.status < 500
-    except Exception:
-        return False
+    return harness_gates.dev_server_up(DEV_URL)
 
 
 def _run_e2e_route(route: str, max_actions: int = 12, budget_ms: int = 45000,
                    timeout: int = 90) -> tuple:
-    """Corre el crawler E2E contra una ruta. Devuelve (corrió: bool, errores_fatales: list).
-
-    e2e-runner.js carga chromium de `process.cwd()/node_modules` → lo corremos con
-    cwd=WT_SUBDIR (donde vive playwright del repo objetivo), pasando el path absoluto
-    al runner. Contrato: escenario JSON por stdin → {route,ok,errors:[{kind,where,detail}]}.
-    """
-    scn = {'baseURL': DEV_URL, 'route': route, 'maxActions': max_actions, 'budgetMs': budget_ms}
-    if STORAGE:
-        scn['storageState'] = STORAGE
-    runner = str(Path(__file__).parent / 'e2e-runner.js')
-    env = dict(os.environ)
-    env.setdefault('DASHBOARD_NM', str(WT_SUBDIR / 'node_modules'))
-    try:
-        res = subprocess.run(['node', runner], input=json.dumps(scn),
-                             capture_output=True, text=True, timeout=timeout,
-                             cwd=str(WT_SUBDIR), env=env)
-        out = json.loads(res.stdout)
-    except Exception as e:
-        log(f'  [fix] E2E no corrió ({route}): {e}')
-        return (False, [])
-    if out.get('fatal'):
-        log(f'  [fix] E2E fatal ({route}): {str(out.get("fatal"))[:120]}')
-        return (False, [])
-    fatal = [er for er in out.get('errors', [])
-             if er.get('kind') in ('http', 'pageerror', 'errorUI', 'console')]
-    return (True, fatal)
+    return harness_gates.run_e2e_route(
+        route,
+        dev_url=DEV_URL,
+        storage=STORAGE,
+        wt_subdir=WT_SUBDIR,
+        runner=Path(__file__).parent / 'e2e-runner.js',
+        max_actions=max_actions,
+        budget_ms=budget_ms,
+        timeout=timeout,
+        log=log,
+    )
 
 
 def _run_smoke_subset(file_path: str) -> bool:
-    """Gate de ejecución DIRIGIDO a la ruta del bug. `tsc` ya corrió antes.
-
-    Modo agresivo (default): si no hay dev server o el E2E no puede correr, cae a
-    tsc-only (que ya pasó) para no bloquear todos los fixes por infra ausente.
-    Modo estricto (LOOP_GATE_REQUIRE_E2E=1): bloquea el commit si el E2E no corre.
-    """
-    strict = os.environ.get('LOOP_GATE_REQUIRE_E2E', '0') == '1'
-    try:
-        server_up = _dev_server_up()
-    except Exception:
-        server_up = False
-    if not server_up:
-        if strict:
-            log('  [fix] gate estricto: dev server caído → NO commitear')
-            return False
-        log('  [fix] dev server caído → gate tsc-only')
-        return True
-    route = _route_for_file(file_path)
-    if not route:
-        return True  # lib/ no ruteable: tsc ya cubre
-    ran, fatal = _run_e2e_route(route)
-    if not ran:
-        if strict:
-            log(f'  [fix] E2E no corrió en {route} (estricto) → NO commitear')
-            return False
-        log(f'  [fix] E2E no corrió en {route} → tsc-only')
-        return True
-    if fatal:
-        log(f'  [fix] E2E {route}: {len(fatal)} fatales {[f.get("kind") for f in fatal]} → revertir')
-        return False
-    log(f'  [fix] E2E {route}: limpio ✓')
-    return True
+    return harness_gates.run_smoke_subset(
+        file_path,
+        dev_url=DEV_URL,
+        log=log,
+        is_risky_path=tiers.is_risky_path,
+        dev_server_up_fn=_dev_server_up,
+        route_for_file_fn=_route_for_file,
+        run_e2e_route_fn=_run_e2e_route,
+    )
 
 
 def _commit_fix(path: Path, suspect: Suspect) -> Optional[str]:
-    """Commitea el fix en la rama actual (worktree)."""
-    rel = path.relative_to(WT)
-    try:
-        subprocess.run(['git', 'add', str(rel)], cwd=str(WT), check=True, capture_output=True)
-        msg = (
-            f'fix(harness-v6): {suspect.file}:{suspect.line} — {suspect.why[:60]}\n\n'
-            f'Generado por harness v6.\n'
-            f'Hash: {suspect.hash}'
-        )
-        result = subprocess.run(
-            ['git', 'commit', '-m', msg],
-            cwd=str(WT), check=True, capture_output=True, text=True, timeout=30,
-        )
-        # Extraer SHA del commit.
-        rev = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=str(WT), capture_output=True, text=True, timeout=10,
-        )
-        return rev.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        log(f'  [fix] git falló: {e.stderr[:200] if e.stderr else e}')
-        return None
+    return harness_gates.commit_fix(path, suspect, wt=WT, log=log)
 
 
 def _is_risky(suspect: Suspect) -> bool:
@@ -1756,23 +1101,13 @@ def _is_risky(suspect: Suspect) -> bool:
 
 
 def _add_to_review(suspect: Suspect, commit: str, model: str) -> None:
-    items = []
-    if REVIEW_FILE.exists():
-        try:
-            items = json.loads(REVIEW_FILE.read_text())
-        except json.JSONDecodeError:
-            pass
-    items.append({
-        'commit': commit,
-        'file': suspect.file,
-        'line': suspect.line,
-        'why': suspect.why,
-        'snippet': suspect.snippet[:200],
-        'model': model,
-        'created_at': time.time(),
-        'reason': 'toca dinero/stock/estado/auth — requiere revisión humana',
-    })
-    REVIEW_FILE.write_text(json.dumps(items, indent=2))
+    harness_review.add_to_review(
+        suspect,
+        commit,
+        model,
+        review_file=REVIEW_FILE,
+        lock=REVIEW_LOCK,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1780,21 +1115,7 @@ def _add_to_review(suspect: Suspect, commit: str, model: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _map_e2e_route_to_file(route: str) -> Optional[str]:
-    """Mapea ruta E2E (p.ej. '/clientes') a archivo en worktree."""
-    route = route.strip('/').lower()
-    if not route:
-        return 'app/page.tsx'
-    candidates = [
-        f'app/(panel)/{route}/page.tsx',
-        f'app/{route}/page.tsx',
-        f'pages/{route}.tsx',
-        f'pages/{route}/index.tsx',
-    ]
-    for cand in candidates:
-        if (WT_SUBDIR / cand).exists():
-            return cand
-    log(f'    [e2e-map] {route} → no encontrado en {candidates}')
-    return None
+    return harness_gates.map_e2e_route_to_file(route, wt_subdir=WT_SUBDIR, log=log)
 
 def _e2e_task_worker(wid: int = 0) -> None:
     """Worker E2E: consume tareas de `e2e_taskq` y emite hallazgos a suspectq.
@@ -1892,13 +1213,7 @@ def _e2e_task_worker(wid: int = 0) -> None:
 
 
 def _dev_server_alive() -> bool:
-    """Chequeo barato: el dev_url responde algo (HTTP 200/3xx/4xx = vivo)."""
-    try:
-        req = urllib.request.Request(DEV_URL, method='HEAD')
-        with urllib.request.urlopen(req, timeout=3) as r:
-            return r.status < 600
-    except Exception:
-        return False
+    return harness_gates.dev_server_alive(DEV_URL)
 
 
 def e2e_producer(stop_event: threading.Event) -> None:
@@ -2026,59 +1341,34 @@ MEM = memory.Memory.load()
 
 
 def discover_zones() -> list[str]:
-    """Descubre las zonas del dashboard (archivos del App Router)."""
-    app_dir = WT / SUBDIR / 'app' / '(panel)'
-    if not app_dir.exists():
-        return []
-    zones = []
-    for entry in sorted(app_dir.iterdir()):
-        if entry.is_dir() and not entry.name.startswith('('):
-            zones.append(f'app/(panel)/{entry.name}/')
-    return zones
+    return harness_discovery.discover_zones(wt=WT, subdir=SUBDIR)
 
 
 def discover_code_zones() -> list[list[str]]:
-    """Agrupa archivos TS por zona para los hunters."""
-    app_dir = WT / SUBDIR / 'app' / '(panel)'
-    lib_dir = WT / SUBDIR / 'lib'
-    groups: dict[str, list[str]] = {}
-
-    if app_dir.exists():
-        for entry in sorted(app_dir.iterdir()):
-            if entry.is_dir() and not entry.name.startswith('('):
-                zone = f'app/(panel)/{entry.name}/'
-                files = []
-                for ts in entry.rglob('*.tsx'):
-                    files.append(str(ts.relative_to(WT / SUBDIR)))
-                for ts in entry.rglob('*.ts'):
-                    if not ts.name.endswith('.test.ts'):
-                        files.append(str(ts.relative_to(WT / SUBDIR)))
-                if files:
-                    groups[zone] = files[:30]  # límite por zona
-
-    if lib_dir.exists():
-        for ts in lib_dir.rglob('*.ts'):
-            rel = str(ts.relative_to(WT / SUBDIR))
-            if '.test.' in rel:
-                continue
-            # Agrupa por prefijo (lib/queries/, lib/db/, etc.).
-            prefix = '/'.join(rel.split('/')[:2]) + '/'
-            groups.setdefault(prefix, []).append(rel)
-            if len(groups[prefix]) > 30:
-                groups[prefix] = groups[prefix][:30]
-
-    return list(groups.values())
+    return harness_discovery.discover_code_zones(wt=WT, subdir=SUBDIR)
 
 
 def main() -> None:
-    global args
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-e2e', action='store_true', help='skip E2E sweep')
     parser.add_argument('--dry-run', action='store_true', help='no aplicar fixes')
-    args = parser.parse_args()
+    parser.parse_args(namespace=args)
+
+    # LOOP_OLLAMA_GPU_CONC=0 → el semáforo de _ollama_sem tiene 0 permits y
+    # TODAS las llamadas a Ollama se cuelgan en silencio. Validar ANTES de
+    # arrancar cualquier worker.
+    try:
+        _ollama_conc = int(os.environ.get('LOOP_OLLAMA_GPU_CONC', '1'))
+    except ValueError:
+        log(f'  ERROR: LOOP_OLLAMA_GPU_CONC debe ser un entero, '
+            f'got {os.environ.get("LOOP_OLLAMA_GPU_CONC")!r}')
+        sys.exit(1)
+    if _ollama_conc <= 0:
+        log(f'  ERROR: LOOP_OLLAMA_GPU_CONC debe ser > 0, got {_ollama_conc}')
+        sys.exit(1)
 
     log('=' * 78)
-    log('  HARNESS v6 — Adaptativo, Cuota-Aware, Memoria Persistente')
+    log('  HARNESS v7 — Adaptativo, Cuota-Aware, Memoria Persistente')
     log('=' * 78)
     log(f'  Tier 0 hunters:        {[s.id for s in tiers.get_tier0_hunters()]}')
     log(f'  Tier 0 second opinion: {[s.id for s in tiers.get_tier0_30b()]}')
@@ -2154,10 +1444,9 @@ def main() -> None:
                 judge_specs = [s for s in judge_specs if s.id in mcfg_t2]
                 if not judge_specs:
                     judge_specs = [s for s in tiers.TIER2_JUDGES if s.id in mcfg_t2]
-            if mcfg_t3:
-                fixers_preselect = mcfg_t3  # se usa en fixer_worker
-            if mcfg_t4:
-                arbiters_preselect = mcfg_t4  # se usa en tier 4
+            # tier3_fixers y tier4_arbiters NO se filtran todavía: el fixer chain
+            # (en fixer_worker) y el tier 4 (árbitros) aún no leen mcfg_t3/mcfg_t4.
+            # Las variables quedan disponibles para `any_filtered` y para uso futuro.
             any_filtered = mcfg_t1 or mcfg_t2 or mcfg_t3 or mcfg_t4
             if any_filtered:
                 log('  [main] Config de modelos aplicada desde TUI (/tmp/harness-models.json)')

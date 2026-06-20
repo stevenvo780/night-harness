@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -52,6 +53,59 @@ def est_vram_mib(size_bytes: int) -> int:
     Formula del spec §4.4: size_bytes / (1024*1024) * 1.10 (overhead VRAM).
     """
     return int(size_bytes / (1024 * 1024) * VRAM_OVERHEAD)
+
+
+# VRAM estimate catalog para el "budget fill" de GPUs (plan_models).
+# Claves: tamaño del modelo (lo que va después de los ':' en el model id,
+# p.ej. "7b" en "qwen2.5-coder:7b"). Valor: VRAM estimada en MiB.
+# Mantener sincronizado con la lista de modelos soportados.
+FILL_VRAM_EST: dict[str, int] = {
+    '3b': 2200, '4b': 3700, '7b': 5500, '9b': 7000,
+    '12b': 8000, '14b': 9000, '20b': 13000, '24b': 15000,
+    '30b': 17000, '32b': 20000,
+}
+FILL_VRAM_DEFAULT_MIB = 4000  # fallback para modelos sin size tag o size desconocida
+
+# Track para no spammear logs cuando se ve un modelo desconocido muchas veces.
+_warned_unknown_vram_models: set[str] = set()
+
+
+def _estimate_vram_for_model(name: Optional[str]) -> int:
+    """Estimate VRAM (MiB) for a model id like 'qwen2.5-coder:7b'.
+
+    Extrae la etiqueta '<N>b' con regex (NO substring match) y la busca
+    en FILL_VRAM_EST. Si la size tag no se puede extraer o no esta en el
+    catalogo, devuelve FILL_VRAM_DEFAULT_MIB y loggea un warning la PRIMERA
+    vez que vea ese nombre, para que el catalogo se pueda extender.
+
+    Bug previo: el codigo usaba `if k in name` (substring), asi que un
+    modelo 'qwen2.5-coder:17b' matcheaba '7b' incorrectamente. Con el
+    fallback 4000 MiB, el bug pasaba silencioso. El regex ahora matchea
+    la size tag directamente (e.g. '17b' o '7b' pero no ambos).
+    """
+    if not name:
+        return FILL_VRAM_DEFAULT_MIB
+    m = re.search(r'(\d+)b', name)
+    if m is None:
+        if name not in _warned_unknown_vram_models:
+            logging.warning(
+                f'fleet: cannot extract size tag from model {name!r}; '
+                f'using {FILL_VRAM_DEFAULT_MIB} MiB fallback. '
+                f'Add the size to FILL_VRAM_EST in fleet.py.'
+            )
+            _warned_unknown_vram_models.add(name)
+        return FILL_VRAM_DEFAULT_MIB
+    key = f'{m.group(1)}b'
+    if key in FILL_VRAM_EST:
+        return FILL_VRAM_EST[key]
+    if name not in _warned_unknown_vram_models:
+        logging.warning(
+            f'fleet: unknown model size {key!r} for {name!r}; '
+            f'using {FILL_VRAM_DEFAULT_MIB} MiB fallback. '
+            f'Add {key!r} to FILL_VRAM_EST in fleet.py.'
+        )
+        _warned_unknown_vram_models.add(name)
+    return FILL_VRAM_DEFAULT_MIB
 
 
 @dataclass
@@ -308,11 +362,9 @@ def plan_models(node: Node) -> dict:
     # El primer modelo ya se asignó arriba; ahora, si sobra VRAM, llenamos
     # con cuantos modelos chicos adicionales quepan (sin duplicarlos entre GPUs).
     # Cada modelo extra = otro hunter en paralelo = más abundancia.
-    _FILL_VRAM_EST: dict[str, int] = {
-        '3b': 2200, '4b': 3700, '7b': 5500, '9b': 7000,
-        '12b': 8000, '14b': 9000, '20b': 13000, '24b': 15000,
-        '30b': 13000, '32b': 20000,
-    }
+    # El catalogo (FILL_VRAM_EST) y el helper (_estimate_vram_for_model) viven a
+    # nivel de modulo, no de funcion, para que el regex de size tag se evalue
+    # una sola vez y para poder testearlo de forma aislada.
     assigned_models = {g.assigned_model for g in gpus_sorted if g.assigned_model}
     assigned_models.update(
         spec.id.rsplit(':', 1)[-1] for spec in hunter_specs if spec.id.startswith('ollama:')
@@ -320,19 +372,16 @@ def plan_models(node: Node) -> dict:
     # VRAM budget: 80% del total de la GPU, menos lo ya asignado.
     gpu_budget: dict[int, int] = {}
     for gpu in gpus_sorted:
-        est_assigned = next(
-            (v for k, v in _FILL_VRAM_EST.items() if gpu.assigned_model and k in gpu.assigned_model),
-            4000,
+        est_assigned = (
+            _estimate_vram_for_model(gpu.assigned_model)
+            if gpu.assigned_model
+            else FILL_VRAM_DEFAULT_MIB
         )
         gpu_budget[gpu.index] = int(gpu.vram_total_mib * 0.85) - est_assigned
     for gpu in gpus_sorted:
         for pref in SMALL_HUNTER_PREF + BIG_GPU_FALLBACK_PREF:
-            base = pref.rsplit(':', 1)[-1] if ':' in pref else pref
             if pref in installed and pref not in assigned_models:
-                est = next(
-                    (v for k, v in _FILL_VRAM_EST.items() if k in base),
-                    4000,
-                )
+                est = _estimate_vram_for_model(pref)
                 if gpu_budget.get(gpu.index, 0) > est:
                     hunter_specs.append(_make_ollama_spec(node, pref, gpu, 'hunter'))
                     gpu_budget[gpu.index] -= est

@@ -23,7 +23,22 @@ def looks_like_patch(text: str) -> bool:
 def patch_files(diff_text: str) -> set[str]:
     """Extract touched file paths from a unified diff."""
     files = set()
+    old_remaining = new_remaining = 0
     for line in diff_text.splitlines():
+        if old_remaining or new_remaining:
+            # Hunk content can look like a file header (e.g. -- i; -> ++ i;).
+            if line.startswith((' ', '-')):
+                old_remaining -= 1
+            if line.startswith((' ', '+')):
+                new_remaining -= 1
+            continue
+
+        hunk = re.match(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@', line)
+        if hunk:
+            old_remaining = int(hunk.group(1)) if hunk.group(1) is not None else 1
+            new_remaining = int(hunk.group(2)) if hunk.group(2) is not None else 1
+            continue
+
         if line.startswith(('+++ ', '--- ')):
             path = line[4:].split('\t', 1)[0].strip()
             if path and path != '/dev/null':
